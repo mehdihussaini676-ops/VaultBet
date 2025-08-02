@@ -157,4 +157,7 @@ async def slots(ctx, wager: float):
     save_balances(balances)
     await ctx.respond(msg)
 
+import discord
+print(f"discord.py version: {discord.__version__}")
+
 bot.run(TOKEN)
