@@ -27,6 +27,18 @@ def save_balances(balances):
     with open("balances.json", "w") as f:
         json.dump(balances, f)
 
+# Load user LTC prices
+def load_user_ltc_prices():
+    if not os.path.exists("user_ltc_prices.json"):
+        return {}
+    with open("user_ltc_prices.json", "r") as f:
+        return json.load(f)
+
+# Save user LTC prices
+def save_user_ltc_prices(prices):
+    with open("user_ltc_prices.json", "w") as f:
+        json.dump(prices, f)
+
 # Load withdraw queue
 def load_withdraw_queue():
     if not os.path.exists("withdraw_queue.json"):
@@ -57,14 +69,32 @@ def init_user(user_id):
         balances[user_id] = {"balance": 0.0, "deposited": 0.0, "withdrawn": 0.0, "wagered": 0.0}
     if user_id not in rakeback_data:
         rakeback_data[user_id] = {"total_wagered": 0.0, "rakeback_earned": 0.0}
+    if user_id not in user_ltc_prices:
+        # Set default LTC price of $100 for new users (will be updated on first deposit)
+        user_ltc_prices[user_id] = 100.0
 
 # Check if user is admin
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+# Cooldown tracking
+COOLDOWN_TIME = 1.0  # 1 second cooldown
+user_cooldowns = {}
+
+def check_cooldown(user_id):
+    current_time = asyncio.get_event_loop().time()
+    if user_id in user_cooldowns:
+        last_used_time = user_cooldowns[user_id]
+        remaining_time = COOLDOWN_TIME - (current_time - last_used_time)
+        if remaining_time > 0:
+            return False, remaining_time
+    user_cooldowns[user_id] = current_time
+    return True, 0
+
 balances = load_balances()
 withdraw_queue = load_withdraw_queue()
 rakeback_data = load_rakeback_data()
+user_ltc_prices = load_user_ltc_prices()
 
 # Rakeback system constants
 RAKEBACK_PERCENTAGE = 0.005  # 0.5%
@@ -86,6 +116,33 @@ async def get_ltc_to_usd():
     except:
         # Fallback rate if API fails
         return 100.0  # Default LTC price
+
+# Logging functions for deposit and withdraw channels
+async def log_deposit(member, amount_usd):
+    deposit_channel_id = 1403907103944605736
+    channel = bot.get_channel(deposit_channel_id)
+    if channel:
+        embed = discord.Embed(
+            title="💸 New Deposit Logged",
+            color=0x00ff00
+        )
+        embed.add_field(name="👤 Depositor", value=member.display_name, inline=True)
+        embed.add_field(name="💵 Amount Deposited", value=f"${amount_usd:.2f} USD", inline=True)
+        embed.add_field(name="📊 Total Deposited by User", value=f"${balances[str(member.id)]['deposited']:.2f} USD", inline=True)
+        await channel.send(embed=embed)
+
+async def log_withdraw(member, amount_usd, ltc_address):
+    withdraw_channel_id = 1403907128023842996
+    channel = bot.get_channel(withdraw_channel_id)
+    if channel:
+        embed = discord.Embed(
+            title="💸 New Withdrawal Logged",
+            color=0xffaa00
+        )
+        embed.add_field(name="👤 Withdrawer", value=member.display_name, inline=True)
+        embed.add_field(name="💵 Amount Withdrawn", value=f"${amount_usd:.2f} USD", inline=True)
+        embed.add_field(name="📍 LTC Address", value=f"`{ltc_address}`", inline=False)
+        await channel.send(embed=embed)
 
 @bot.event
 async def on_ready():
@@ -125,8 +182,8 @@ async def balance(ctx):
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Use user's fixed LTC price instead of live market price
+    ltc_price = user_ltc_prices[user_id]
 
     user_data = balances[user_id]
     current_balance_ltc = user_data["balance"]
@@ -134,7 +191,7 @@ async def balance(ctx):
     total_withdrawn_ltc = user_data["withdrawn"]
     total_wagered_ltc = user_data["wagered"]
 
-    # Convert to USD
+    # Convert to USD using user's fixed LTC price
     current_balance_usd = current_balance_ltc * ltc_price
     total_deposited_usd = total_deposited_ltc * ltc_price
     total_withdrawn_usd = total_withdrawn_ltc * ltc_price
@@ -156,7 +213,121 @@ async def balance(ctx):
     embed.add_field(name=f"{profit_loss_emoji} Profit/Loss", value=f"${profit_loss_usd:.2f} USD", inline=True)
     embed.add_field(name="📊 Win Rate", value="Coming Soon!", inline=True)
 
-    embed.set_footer(text=f"Use /coinflip, /dice, /rps, or /slots to gamble! • LTC Price: ${ltc_price:.2f}")
+    embed.set_footer(text=f"Use /coinflip, /dice, /rps, or /slots to gamble! • Your LTC Price: ${ltc_price:.2f}")
+
+    await ctx.respond(embed=embed)
+
+# CLAIM RAKEBACK
+@bot.slash_command(name="claimrakeback", description="Claim your accumulated rakeback (0.5% of total wagered)")
+async def claimrakeback(ctx):
+    user_id = str(ctx.author.id)
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    init_user(user_id)
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
+
+    rakeback_earned_ltc = rakeback_data[user_id]["rakeback_earned"]
+
+    if rakeback_earned_ltc <= 0:
+        await ctx.respond("❌ You don't have any rakeback to claim! Start gambling to earn rakeback.", ephemeral=True)
+        return
+
+    # Add rakeback to balance and reset earned rakeback
+    balances[user_id]["balance"] += rakeback_earned_ltc
+    total_wagered_ltc = rakeback_data[user_id]["total_wagered"]
+    rakeback_data[user_id]["rakeback_earned"] = 0.0
+
+    save_balances(balances)
+    save_rakeback_data(rakeback_data)
+
+    # Convert to USD for display
+    rakeback_earned_usd = rakeback_earned_ltc * ltc_price
+    total_wagered_usd = total_wagered_ltc * ltc_price
+    new_balance_usd = balances[user_id]["balance"] * ltc_price
+
+    embed = discord.Embed(
+        title="💰 Rakeback Claimed Successfully! 🎉",
+        color=0x00ff00
+    )
+    embed.add_field(name="💸 Rakeback Claimed", value=f"${rakeback_earned_usd:.2f} USD", inline=True)
+    embed.add_field(name="🎲 Total Wagered", value=f"${total_wagered_usd:.2f} USD", inline=True)
+    embed.add_field(name="📊 Rakeback Rate", value="0.5%", inline=True)
+    embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
+    embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Keep gambling to earn more rakeback!")
+
+    await ctx.respond(embed=embed)
+
+# TIP PLAYER
+@bot.slash_command(name="tip", description="Tip another player some of your balance (in USD)")
+async def tip(ctx, member: discord.Member, amount_usd: float):
+    user_id = str(ctx.author.id)
+    target_id = str(member.id)
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Security checks
+    if user_id == target_id:
+        await ctx.respond("❌ You cannot tip yourself!", ephemeral=True)
+        return
+
+    if member.bot:
+        await ctx.respond("❌ You cannot tip bots!", ephemeral=True)
+        return
+
+    if amount_usd <= 0:
+        await ctx.respond("❌ Tip amount must be positive!", ephemeral=True)
+        return
+
+    if amount_usd < 0.01:
+        await ctx.respond("❌ Minimum tip amount is $0.01 USD!", ephemeral=True)
+        return
+
+    if amount_usd > 1000:
+        await ctx.respond("❌ Maximum tip amount is $1000 USD!", ephemeral=True)
+        return
+
+    init_user(user_id)
+    init_user(target_id)
+
+    # Use sender's fixed LTC price for the conversion
+    ltc_price = user_ltc_prices[user_id]
+    amount_ltc = amount_usd / ltc_price
+
+    if balances[user_id]["balance"] < amount_ltc:
+        current_balance_usd = balances[user_id]["balance"] * ltc_price
+        await ctx.respond(f"❌ You don't have enough balance! You have ${current_balance_usd:.2f} USD but tried to tip ${amount_usd:.2f} USD.")
+        return
+
+    # Process the tip
+    balances[user_id]["balance"] -= amount_ltc
+    balances[target_id]["balance"] += amount_ltc
+    save_balances(balances)
+
+    # Update balances in USD for display
+    sender_new_balance_usd = balances[user_id]["balance"] * ltc_price
+    receiver_new_balance_usd = balances[target_id]["balance"] * ltc_price
+
+    embed = discord.Embed(
+        title="💝 Tip Sent Successfully! 🎉",
+        color=0x00ff00
+    )
+    embed.add_field(name="👤 From", value=ctx.author.display_name, inline=True)
+    embed.add_field(name="👤 To", value=member.display_name, inline=True)
+    embed.add_field(name="💰 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+    embed.add_field(name="💳 Your New Balance", value=f"${sender_new_balance_usd:.2f} USD", inline=True)
+    embed.add_field(name="💳 Their New Balance", value=f"${receiver_new_balance_usd:.2f} USD", inline=True)
+    embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Spread the love!")
 
     await ctx.respond(embed=embed)
 
@@ -167,7 +338,13 @@ async def addbalance(ctx, member: discord.Member, amount_usd: float):
         await ctx.respond("You do not have permission to use this command.", ephemeral=True)
         return
 
-    # Get current LTC price
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Get current LTC price for admin commands
     ltc_price = await get_ltc_to_usd()
     amount_ltc = amount_usd / ltc_price
 
@@ -194,8 +371,14 @@ async def coinflip(ctx, choice: discord.Option(str, "Choose heads or tails", cho
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -207,8 +390,8 @@ async def coinflip(ctx, choice: discord.Option(str, "Choose heads or tails", cho
     won = coin_flip == choice
 
     if won:
-        # 95% RTP - pay out 0.95x for wins (5% house edge)
-        winnings_ltc = wager_ltc * 0.95
+        # 90% RTP - pay out 0.90x for wins (10% house edge)
+        winnings_ltc = wager_ltc * 0.90
         balances[user_id]["balance"] += winnings_ltc
         new_balance_usd = balances[user_id]["balance"] * ltc_price
         color = 0x00ff00
@@ -239,8 +422,14 @@ async def dice(ctx, wager_usd: float):
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -252,8 +441,8 @@ async def dice(ctx, wager_usd: float):
     won = roll > 3
 
     if won:
-        # 92% RTP - pay out 0.92x for wins (8% house edge)
-        winnings_ltc = wager_ltc * 0.92
+        # 85% RTP - pay out 0.85x for wins (15% house edge)
+        winnings_ltc = wager_ltc * 0.85
         balances[user_id]["balance"] += winnings_ltc
         new_balance_usd = balances[user_id]["balance"] * ltc_price
         color = 0x00ff00
@@ -284,8 +473,14 @@ async def rps(ctx, choice: discord.Option(str, "Your choice", choices=["rock", "
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -308,8 +503,8 @@ async def rps(ctx, choice: discord.Option(str, "Your choice", choices=["rock", "
         title = "🤝 Rock Paper Scissors - It's a Tie!"
         result_text = f"You both chose **{choice}** {choice_emojis[choice]}!"
     elif win_map[choice] == bot_choice:
-        # Player wins - 94% RTP (6% house edge)
-        winnings_ltc = wager_ltc * 0.94
+        # Player wins - 88% RTP (12% house edge)
+        winnings_ltc = wager_ltc * 0.88
         balances[user_id]["balance"] += winnings_ltc
         new_balance_usd = balances[user_id]["balance"] * ltc_price
         color = 0x00ff00
@@ -341,8 +536,14 @@ async def slots(ctx, wager_usd: float):
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -355,8 +556,8 @@ async def slots(ctx, wager_usd: float):
     result_display = " ".join(result)
 
     if len(set(result)) == 1:
-        # JACKPOT - all 3 match (reduced from 5x to 4x for house edge)
-        multiplier = 4.0
+        # JACKPOT - all 3 match (reduced to 3x for higher house edge)
+        multiplier = 3.0
         winnings_ltc = wager_ltc * multiplier
         balances[user_id]["balance"] += winnings_ltc
         winnings_usd = winnings_ltc * ltc_price
@@ -365,8 +566,8 @@ async def slots(ctx, wager_usd: float):
         title = "🎰 JACKPOT! 💰🎉"
         result_text = f"**{result_display}**\n\nAll three match! You won **${winnings_usd:.2f} USD** (4x multiplier)!"
     elif len(set(result)) == 2:
-        # Two symbols match (reduced from 2x to 1.5x for house edge)
-        multiplier = 1.5
+        # Two symbols match (reduced to 1.2x for higher house edge)
+        multiplier = 1.2
         winnings_ltc = wager_ltc * multiplier
         balances[user_id]["balance"] += winnings_ltc
         winnings_usd = winnings_ltc * ltc_price
@@ -390,7 +591,7 @@ async def slots(ctx, wager_usd: float):
     embed.add_field(name="🎯 Result", value=result_text, inline=False)
     embed.add_field(name="💰 Wagered", value=f"${wager_usd:.2f} USD", inline=True)
     embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
-    embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Jackpot: 4x | Two Match: 1.5x")
+    embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Jackpot: 3x | Two Match: 1.2x")
 
     await ctx.respond(embed=embed)
 
@@ -400,8 +601,14 @@ async def withdraw(ctx, amount_usd: float, ltc_address: str):
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     amount_ltc = amount_usd / ltc_price
 
     if balances[user_id]["balance"] < amount_ltc:
@@ -443,6 +650,8 @@ async def withdraw(ctx, amount_usd: float, ltc_address: str):
     embed.set_footer(text="Your withdrawal will be processed by an admin shortly.")
 
     await ctx.respond(embed=embed)
+    await log_withdraw(ctx.author, amount_usd, ltc_address)
+
 
 # ADMIN: QUEUE
 @bot.slash_command(name="queue", description="Admin command to view pending withdrawals")
@@ -479,13 +688,25 @@ async def confirmdeposit(ctx, member: discord.Member, amount_usd: float):
         await ctx.respond("You do not have permission to use this command.", ephemeral=True)
         return
 
-    # Get current LTC price
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Get current LTC price and set it as user's fixed price
     ltc_price = await get_ltc_to_usd()
     amount_ltc = amount_usd / ltc_price
 
     user_id = str(member.id)
     init_user(user_id)
-    balances[user_id]["deposited"] += amount_ltc
+
+    # Set user's LTC price at deposit time (this becomes their fixed rate)
+    user_ltc_prices[user_id] = ltc_price
+    save_user_ltc_prices(user_ltc_prices)
+
+    balances[user_id]["deposited"] += amount_ltc # Correctly adds to deposited stats
+    balances[user_id]["balance"] += amount_ltc # Add to actual balance
     save_balances(balances)
 
     embed = discord.Embed(
@@ -499,11 +720,20 @@ async def confirmdeposit(ctx, member: discord.Member, amount_usd: float):
 
     await ctx.respond(embed=embed)
 
+    # Log the deposit
+    await log_deposit(member, amount_usd)
+
 # ADMIN: CONFIRM WITHDRAW
 @bot.slash_command(name="confirmwithdraw", description="Admin command to confirm a withdrawal (remove from queue)")
 async def confirmwithdraw(ctx, queue_number: int):
     if not is_admin(ctx.author.id):
         await ctx.respond("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
         return
 
     if not withdraw_queue or queue_number < 1 or queue_number > len(withdraw_queue):
@@ -529,6 +759,12 @@ async def confirmwithdraw(ctx, queue_number: int):
 @bot.slash_command(name="cancelwithdraw", description="Cancel your pending withdrawal")
 async def cancelwithdraw(ctx):
     user_id = str(ctx.author.id)
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
 
     # Find user's withdrawal in queue
     user_request = None
@@ -574,6 +810,12 @@ async def resetstats(ctx, member: discord.Member):
         await ctx.respond("You do not have permission to use this command.", ephemeral=True)
         return
 
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
     user_id = str(member.id)
 
     # Check if user exists
@@ -588,7 +830,10 @@ async def resetstats(ctx, member: discord.Member):
         "withdrawn": 0.0,
         "wagered": 0.0
     }
+    # Reset user's LTC price to default
+    user_ltc_prices[user_id] = 100.0
     save_balances(balances)
+    save_user_ltc_prices(user_ltc_prices)
 
     # Also remove any pending withdrawals for this user
     global withdraw_queue
@@ -618,8 +863,14 @@ async def blackjack(ctx, wager_usd: float):
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -676,14 +927,14 @@ async def blackjack(ctx, wager_usd: float):
             title = "🃏 Blackjack - Push! 🤝"
             result_text = "Both you and the dealer have Blackjack!"
         elif player_blackjack:
-            # Player wins with blackjack (1.2x payout + return wager for house edge)
-            total_payout = wager_ltc + (wager_ltc * 1.2)
+            # Player wins with blackjack (1.5x payout + return wager)
+            total_payout = wager_ltc + (wager_ltc * 1.5)
             balances[user_id]["balance"] += total_payout
             new_balance_usd = balances[user_id]["balance"] * ltc_price
-            winnings_usd = (wager_ltc * 1.2) * ltc_price
+            winnings_usd = (wager_ltc * 1.5) * ltc_price
             color = 0x00ff00
             title = "🃏 BLACKJACK! 🎉"
-            result_text = f"You got Blackjack! Won ${winnings_usd:.2f} USD (1.2x payout)!"
+            result_text = f"You got Blackjack! Won ${winnings_usd:.2f} USD (1.5x payout)!"
         else:
             # Dealer has blackjack, player loses (wager already deducted)
             new_balance_usd = balances[user_id]["balance"] * ltc_price
@@ -701,7 +952,7 @@ async def blackjack(ctx, wager_usd: float):
         embed.add_field(name="🎯 Result", value=result_text, inline=False)
         embed.add_field(name="💰 Wagered", value=f"${wager_usd:.2f} USD", inline=True)
         embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
-        embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Blackjack pays 1.2x")
+        embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Blackjack pays 1.5x")
 
         await ctx.respond(embed=embed)
         return
@@ -712,17 +963,23 @@ async def blackjack(ctx, wager_usd: float):
 
     # Interactive blackjack game
     class BlackjackView(discord.ui.View):
-        def __init__(self, player_hand, dealer_hand, deck, wager_ltc, wager_usd, ltc_price, user_id):
+        def __init__(self, player_hand, dealer_hand, deck, wager_ltc, wager_usd, ltc_price, user_id, original_wager_ltc, original_wager_usd):
             super().__init__(timeout=180)
             self.player_hand = player_hand
             self.dealer_hand = dealer_hand
             self.deck = deck
-            self.wager_ltc = wager_ltc
+            self.wager_ltc = wager_ltc # Current wager, can be doubled
             self.wager_usd = wager_usd
             self.ltc_price = ltc_price
             self.user_id = user_id
+            self.original_wager_ltc = original_wager_ltc
+            self.original_wager_usd = original_wager_usd
             self.game_over = False
             self.can_double_down = True # Flag to track if double down is allowed
+
+        async def update_message(self, interaction, embed):
+             # Update the message with the new embed and view state
+            await interaction.response.edit_message(embed=embed, view=self)
 
         @discord.ui.button(label="Hit", style=discord.ButtonStyle.green, emoji="🃏")
         async def hit_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -736,15 +993,12 @@ async def blackjack(ctx, wager_usd: float):
 
             # Once player hits, double down is no longer an option
             self.can_double_down = False
-
-            # Update the buttons to remove double down option if no longer available
-            if not self.can_double_down:
-                # Find and disable the double down button instead of recreating everything
-                for item in self.children:
-                    if hasattr(item, 'label') and item.label == "Double Down":
-                        item.disabled = True
-                        item.style = discord.ButtonStyle.gray
-                        break
+            # Disable double down button if it exists and player hits
+            for item in self.children:
+                if hasattr(item, 'label') and item.label == "Double Down":
+                    item.disabled = True
+                    item.style = discord.ButtonStyle.gray
+                    break
 
             if player_value > 21:
                 # Player busts (wager already deducted when game started)
@@ -757,14 +1011,14 @@ async def blackjack(ctx, wager_usd: float):
                 embed = discord.Embed(title="🃏 Blackjack - BUST! 💥", color=0xff0000)
                 embed.add_field(name="🃏 Your Hand", value=f"{format_hand(self.player_hand)} = {player_value}", inline=True)
                 embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand, hide_first=True)} = ?", inline=True)
-                embed.add_field(name="🎯 Result", value=f"You busted with {player_value}! You lose.", inline=False)
+                embed.add_field(name="🎯 Result", value=f"You busted with {player_value}! You lose ${self.wager_usd:.2f} USD.", inline=False)
                 embed.add_field(name="💰 Wagered", value=f"${self.wager_usd:.2f} USD", inline=True)
                 embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
                 embed.set_footer(text=f"LTC Price: ${self.ltc_price:.2f}")
 
                 self.game_over = True
                 self.clear_items()  # Only clear buttons when game ends
-                await interaction.response.edit_message(embed=embed, view=self)
+                await self.update_message(interaction, embed)
             else:
                 # Update the embed with new hand - player can continue hitting or stand
                 embed = discord.Embed(title="🃏 Blackjack - Your Turn", color=0x0099ff)
@@ -773,7 +1027,7 @@ async def blackjack(ctx, wager_usd: float):
                 embed.add_field(name="💰 Wager", value=f"${self.wager_usd:.2f} USD", inline=True)
                 embed.set_footer(text="Hit: take another card | Stand: keep hand")
 
-                await interaction.response.edit_message(embed=embed, view=self)
+                await self.update_message(interaction, embed)
 
         @discord.ui.button(label="Stand", style=discord.ButtonStyle.red, emoji="✋")
         async def stand_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -792,15 +1046,15 @@ async def blackjack(ctx, wager_usd: float):
 
             # Determine winner
             if dealer_value > 21:
-                # Dealer busts, player wins (96% RTP - 4% house edge)
-                winnings = self.wager_ltc + (self.wager_ltc * 0.96)
+                # Dealer busts, player wins (92% RTP - 8% house edge)
+                winnings = self.wager_ltc + (self.wager_ltc * 0.92)
                 balances[self.user_id]["balance"] += winnings
                 color = 0x00ff00
                 title = "🃏 Blackjack - YOU WON! 🎉"
                 result_text = f"Dealer busted with {dealer_value}!"
             elif player_value > dealer_value:
-                # Player wins (96% RTP - 4% house edge)
-                winnings = self.wager_ltc + (self.wager_ltc * 0.96)
+                # Player wins (92% RTP - 8% house edge)
+                winnings = self.wager_ltc + (self.wager_ltc * 0.92)
                 balances[self.user_id]["balance"] += winnings
                 color = 0x00ff00
                 title = "🃏 Blackjack - YOU WON! 🎉"
@@ -832,7 +1086,7 @@ async def blackjack(ctx, wager_usd: float):
 
             self.game_over = True
             self.clear_items()
-            await interaction.response.edit_message(embed=embed, view=self)
+            await self.update_message(interaction, embed)
 
         @discord.ui.button(label="Double Down", style=discord.ButtonStyle.blurple, emoji="💸")
         async def double_down_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -879,7 +1133,7 @@ async def blackjack(ctx, wager_usd: float):
                 embed.set_footer(text=f"LTC Price: ${self.ltc_price:.2f}")
 
                 self.game_over = True
-                await interaction.response.edit_message(embed=embed, view=self)
+                await self.update_message(interaction, embed)
             else:
                 # Player stands after doubling down, dealer plays
                 while hand_value(self.dealer_hand) < 17:
@@ -889,15 +1143,15 @@ async def blackjack(ctx, wager_usd: float):
 
                 # Determine winner
                 if dealer_value > 21:
-                    # Dealer busts, player wins (96% RTP on double down)
-                    winnings = doubled_wager_ltc + (doubled_wager_ltc * 0.96)
+                    # Dealer busts, player wins (92% RTP on double down)
+                    winnings = doubled_wager_ltc + (doubled_wager_ltc * 0.92)
                     balances[self.user_id]["balance"] += winnings
                     color = 0x00ff00
                     title = "🃏 Blackjack - YOU WON After Double Down! 🎉"
                     result_text = f"Dealer busted with {dealer_value}! You win ${doubled_wager_usd:.2f} USD."
                 elif player_value > dealer_value:
-                    # Player wins (96% RTP on double down)
-                    winnings = doubled_wager_ltc + (doubled_wager_ltc * 0.96)
+                    # Player wins (92% RTP on double down)
+                    winnings = doubled_wager_ltc + (doubled_wager_ltc * 0.92)
                     balances[self.user_id]["balance"] += winnings
                     color = 0x00ff00
                     title = "🃏 Blackjack - YOU WON After Double Down! 🎉"
@@ -928,7 +1182,7 @@ async def blackjack(ctx, wager_usd: float):
                 embed.set_footer(text=f"LTC Price: ${self.ltc_price:.2f}")
 
                 self.game_over = True
-                await interaction.response.edit_message(embed=embed, view=self)
+                await self.update_message(interaction, embed)
 
 
     # Create initial embed
@@ -938,7 +1192,7 @@ async def blackjack(ctx, wager_usd: float):
     embed.add_field(name="💰 Wager", value=f"${wager_usd:.2f} USD", inline=True)
     embed.set_footer(text="Hit: take another card | Stand: keep hand | Double Down: double bet + 1 card") # Updated footer
 
-    view = BlackjackView(player_hand, dealer_hand, deck, wager_ltc, wager_usd, ltc_price, user_id)
+    view = BlackjackView(player_hand, dealer_hand, deck, wager_ltc, wager_usd, ltc_price, user_id, wager_ltc, wager_usd)
     await ctx.respond(embed=embed, view=view)
 
 # MINES
@@ -947,8 +1201,14 @@ async def mines(ctx, wager_usd: float, mine_count: discord.Option(int, "Number o
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -971,11 +1231,11 @@ async def mines(ctx, wager_usd: float, mine_count: discord.Option(int, "Number o
         if diamonds_found == 0:
             return 0
 
-        # More mines = higher risk = higher multiplier (further reduced for house edge)
-        mine_multiplier = 1 + (total_mines * 0.03)
+        # More mines = higher risk = higher multiplier
+        mine_multiplier = 1 + (total_mines * 0.05)
 
-        # Each diamond found increases multiplier (further reduced for house edge)
-        diamond_multiplier = 1 + (diamonds_found * 0.08)
+        # Each diamond found increases multiplier
+        diamond_multiplier = 1 + (diamonds_found * 0.15)
 
         return round(mine_multiplier * diamond_multiplier, 2)
 
@@ -993,7 +1253,6 @@ async def mines(ctx, wager_usd: float, mine_count: discord.Option(int, "Number o
             self.game_over = False
             self.current_multiplier = 1.0
 
-            # Create a 5x5 grid (25 tiles)
             for i in range(25):
                 button = discord.ui.Button(
                     label="⬜",
@@ -1138,6 +1397,7 @@ async def mines(ctx, wager_usd: float, mine_count: discord.Option(int, "Number o
             embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
             embed.set_footer(text=f"LTC Price: ${self.ltc_price:.2f} • Smart move!")
 
+            self.clear_items()
             await interaction.response.edit_message(embed=embed, view=self)
 
     # Create initial embed
@@ -1159,8 +1419,14 @@ async def towers(ctx, wager_usd: float, difficulty: discord.Option(int, "Difficu
     user_id = str(ctx.author.id)
     init_user(user_id)
 
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Use user's fixed LTC price
+    ltc_price = user_ltc_prices[user_id]
     wager_ltc = wager_usd / ltc_price
 
     if balances[user_id]["balance"] < wager_ltc:
@@ -1182,9 +1448,9 @@ async def towers(ctx, wager_usd: float, difficulty: discord.Option(int, "Difficu
         tower_structure.append(correct_path)
 
     def get_tower_multiplier(level, difficulty):
-        # Higher levels and higher difficulty = higher multiplier (reduced for house edge)
+        # Higher levels and higher difficulty = higher multiplier (reduced for higher house edge)
         base_multiplier = 1.0
-        level_bonus = level * (0.2 + (difficulty - 2) * 0.05)
+        level_bonus = level * (0.15 + (difficulty - 2) * 0.03)
         return round(base_multiplier + level_bonus, 2)
 
     class TowersView(discord.ui.View):
@@ -1309,8 +1575,17 @@ async def towers(ctx, wager_usd: float, difficulty: discord.Option(int, "Difficu
                 await interaction.response.send_message("You need to climb at least one level before cashing out!", ephemeral=True)
                 return
 
+            # Check cooldown
+            can_proceed, remaining_time = check_cooldown(self.user_id)
+            if not can_proceed:
+                await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before another action.", ephemeral=True)
+                return
+
             # Cash out
             self.game_over = True
+            for child in self.children:
+                child.disabled = True
+
             winnings_ltc = self.wager_ltc * self.current_multiplier
             balances[self.user_id]["balance"] += winnings_ltc
             save_balances(balances)
@@ -1342,367 +1617,6 @@ async def towers(ctx, wager_usd: float, difficulty: discord.Option(int, "Difficu
     view = TowersView(tower_structure, wager_ltc, wager_usd, ltc_price, user_id, difficulty)
     await ctx.respond(embed=embed, view=view)
 
-# PLINKO
-@bot.slash_command(name="plinko", description="Drop a ball down the Plinko board for multipliers! (in USD)")
-async def plinko(ctx, wager_usd: float, risk: discord.Option(str, "Risk level", choices=["low", "medium", "high"], default="medium"), rows: discord.Option(int, "Number of rows (8-16)", min_value=8, max_value=16, default=12)):
-    user_id = str(ctx.author.id)
-    init_user(user_id)
-
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
-    wager_ltc = wager_usd / ltc_price
-
-    if balances[user_id]["balance"] < wager_ltc:
-        current_balance_usd = balances[user_id]["balance"] * ltc_price
-        await ctx.respond(f"❌ You don't have enough balance! You have ${current_balance_usd:.2f} USD but tried to wager ${wager_usd:.2f} USD.")
-        return
-
-    # Calculate number of slots based on rows (rows + 1 slots)
-    num_slots = rows + 1
-
-    # Define multiplier patterns for different risk levels based on number of slots
-    def generate_multipliers(risk_level, slots):
-        if risk_level == "low":
-            # Low risk: more consistent, smaller multipliers
-            center = slots // 2
-            mults = []
-            for i in range(slots):
-                distance = abs(i - center)
-                if distance == 0:
-                    mults.append(1.5)
-                elif distance <= 1:
-                    mults.append(1.2)
-                elif distance <= 2:
-                    mults.append(1.0)
-                elif distance <= 3:
-                    mults.append(0.8)
-                else:
-                    mults.append(0.5)
-            return mults
-        elif risk_level == "medium":
-            # Medium risk: balanced
-            edge_multiplier = min(100, slots * 8)
-            center = slots // 2
-            mults = []
-            for i in range(slots):
-                distance = abs(i - center)
-                if distance >= slots // 2:
-                    mults.append(edge_multiplier)
-                elif distance >= slots // 3:
-                    mults.append(max(2, slots // 2))
-                elif distance >= 2:
-                    mults.append(max(1, distance))
-                else:
-                    mults.append(0.2)
-            return mults
-        else:  # high risk
-            # High risk: extreme multipliers
-            edge_multiplier = min(1000, slots * 15)
-            center = slots // 2
-            mults = []
-            for i in range(slots):
-                distance = abs(i - center)
-                if distance >= slots // 2:
-                    mults.append(edge_multiplier)
-                elif distance >= slots // 3:
-                    mults.append(max(10, slots))
-                elif distance >= 2:
-                    mults.append(max(2, distance * 2))
-                elif distance == 1:
-                    mults.append(0.5)
-                else:
-                    mults.append(0.1)
-            return mults
-
-    multipliers = generate_multipliers(risk, num_slots)
-
-    # Create weighted probabilities (center slots more likely)
-    weights = []
-    center = num_slots // 2
-    for i in range(num_slots):
-        distance = abs(i - center)
-        weight = max(1, 10 - distance)
-        weights.append(weight)
-
-    # Choose random slot based on weights
-    slot = random.choices(range(num_slots), weights=weights)[0]
-    multiplier = multipliers[slot]
-
-    # Simulate ball path for animation
-    ball_path = [rows // 2]  # Start at center of top row
-    for row in range(rows):
-        current_pos = ball_path[-1]
-        # Ball can move left or right, but stay within bounds
-        if current_pos <= 0:
-            next_pos = random.choice([0, 1])
-        elif current_pos >= row:
-            next_pos = random.choice([row, row + 1])
-        else:
-            next_pos = random.choice([current_pos, current_pos + 1])
-        ball_path.append(next_pos)
-
-    # Final position should match our calculated slot
-    ball_path[-1] = slot
-
-    class PlinkoAnimationView(discord.ui.View):
-        def __init__(self, ball_path, multipliers, rows, num_slots, wager_ltc, wager_usd, ltc_price, user_id, risk):
-            super().__init__(timeout=60)
-            self.ball_path = ball_path
-            self.multipliers = multipliers
-            self.rows = rows
-            self.num_slots = num_slots
-            self.wager_ltc = wager_ltc
-            self.wager_usd = wager_usd
-            self.ltc_price = ltc_price
-            self.user_id = user_id
-            self.risk = risk
-            self.current_row = 0
-            self.animation_complete = False
-
-        def create_board_visual(self, current_row, ball_position):
-            board = "```\n🏀 PLINKO TRIANGLE\n\n"
-
-            # Create triangle plinko board
-            for row in range(self.rows + 1):
-                line = ""
-                pegs_in_row = row + 1
-                leading_spaces = " " * (self.rows - row + 2)  # Extra padding for better centering
-
-                if row == 0:
-                    # Top row - single peg with ball drop point
-                    if current_row == 0:
-                        line = leading_spaces + "🏀"
-                    else:
-                        line = leading_spaces + "●"
-                elif row < current_row and row < len(self.ball_path):
-                    # Past rows - show only pegs (ball has passed)
-                    line = leading_spaces + " ".join("●" for _ in range(pegs_in_row))
-                elif row == current_row and row < len(self.ball_path):
-                    # Current row - replace the peg at ball position with ball
-                    line = leading_spaces
-                    for pos in range(pegs_in_row):
-                        if pos == self.ball_path[row]:
-                            line += "🏀"  # Ball replaces the peg
-                        else:
-                            line += "●"  # Normal peg
-                        if pos < pegs_in_row - 1:
-                            line += " "
-                else:
-                    # Future rows - just show pegs structure
-                    line = leading_spaces + " ".join("●" for _ in range(pegs_in_row))
-
-                board += line + "\n"
-
-            # Add multiplier slots at bottom (properly centered)
-            board += "\n"
-            # Center the multipliers under the triangle
-            multiplier_padding = " " * 2
-            slot_line = multiplier_padding
-            for i, mult in enumerate(self.multipliers):
-                mult_str = f"{mult}x"
-                if len(mult_str) < 4:  # Pad shorter multipliers
-                    mult_str = mult_str.center(4)
-
-                if i == self.ball_path[-1] and self.animation_complete:
-                    slot_line += f"[{mult_str}]"
-                else:
-                    slot_line += f" {mult_str} "
-
-            board += slot_line + "\n```"
-            return board
-
-        @discord.ui.button(label="Drop Ball!", style=discord.ButtonStyle.primary, emoji="🏀")
-        async def drop_ball(self, button: discord.ui.Button, interaction: discord.Interaction):
-            if interaction.user.id != int(self.user_id):
-                await interaction.response.send_message("This is not your game!", ephemeral=True)
-                return
-
-            button.disabled = True
-
-            # Animate the ball dropping
-            for row in range(self.rows + 1):
-                self.current_row = row
-
-                embed = discord.Embed(title="🏀 Plinko - Ball Dropping!", color=0x0099ff)
-                embed.add_field(name="💰 Wager", value=f"${self.wager_usd:.2f} USD", inline=True)
-                embed.add_field(name="🎲 Risk Level", value=self.risk.title(), inline=True)
-                embed.add_field(name="📏 Rows", value=f"{self.rows}", inline=True)
-                embed.add_field(name="🎯 Current Row", value=f"{row}/{self.rows}", inline=True)
-
-                board_visual = self.create_board_visual(row, self.ball_path[row] if row < len(self.ball_path) else 0)
-                embed.add_field(name="🏀 Plinko Board", value=board_visual, inline=False)
-                embed.set_footer(text="Ball is dropping...")
-
-                if row == 0:
-                    await interaction.response.edit_message(embed=embed, view=self)
-                else:
-                    await interaction.edit_original_response(embed=embed, view=self)
-                await asyncio.sleep(0.8)  # Animation delay
-
-            # Animation complete, show final result
-            self.animation_complete = True
-            final_slot = self.ball_path[-1]
-            final_multiplier = self.multipliers[final_slot]
-
-            # Calculate winnings
-            if final_multiplier >= 1.0:
-                winnings_ltc = self.wager_ltc * final_multiplier
-                balances[self.user_id]["balance"] += winnings_ltc
-                new_balance_usd = balances[self.user_id]["balance"] * self.ltc_price
-                profit_ltc = winnings_ltc - self.wager_ltc
-                profit_usd = profit_ltc * self.ltc_price
-                color = 0x00ff00
-                title = "🏀 Plinko - YOU WON! 🎉"
-                result_text = f"Ball landed in slot {final_slot + 1} with {final_multiplier}x multiplier!\nProfit: ${profit_usd:.2f} USD"
-            else:
-                loss_ltc = self.wager_ltc - (self.wager_ltc * final_multiplier)
-                balances[self.user_id]["balance"] -= loss_ltc
-                new_balance_usd = balances[self.user_id]["balance"] * self.ltc_price
-                loss_usd = loss_ltc * self.ltc_price
-                color = 0xff0000
-                title = "🏀 Plinko - Partial Loss 😔"
-                result_text = f"Ball landed in slot {final_slot + 1} with {final_multiplier}x multiplier.\nLoss: ${loss_usd:.2f} USD"
-
-            balances[self.user_id]["wagered"] += self.wager_ltc
-            add_rakeback(self.user_id, self.wager_ltc)  # Add rakeback
-            save_balances(balances)
-
-            embed = discord.Embed(title=title, color=color)
-            embed.add_field(name="🎯 Result", value=result_text, inline=False)
-            embed.add_field(name="🎲 Risk Level", value=self.risk.title(), inline=True)
-            embed.add_field(name="📏 Rows", value=f"{self.rows}", inline=True)
-            embed.add_field(name="📍 Final Slot", value=f"{final_slot + 1}/{self.num_slots}", inline=True)
-            embed.add_field(name="📈 Multiplier", value=f"{final_multiplier}x", inline=True)
-            embed.add_field(name="💰 Wagered", value=f"${self.wager_usd:.2f} USD", inline=True)
-            embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
-
-            final_board = self.create_board_visual(self.rows, final_slot)
-            embed.add_field(name="🏀 Final Board", value=final_board, inline=False)
-            embed.set_footer(text=f"LTC Price: ${self.ltc_price:.2f}")
-
-            self.clear_items()
-            await interaction.edit_original_response(embed=embed, view=self)
-
-    # Deduct wager
-    balances[user_id]["balance"] -= wager_ltc
-    save_balances(balances)
-
-    # Create initial embed
-    embed = discord.Embed(title="🏀 Plinko - Ready to Drop!", color=0x0099ff)
-    embed.add_field(name="💰 Wager", value=f"${wager_usd:.2f} USD", inline=True)
-    embed.add_field(name="🎲 Risk Level", value=risk.title(), inline=True)
-    embed.add_field(name="📏 Rows", value=f"{rows}", inline=True)
-    embed.add_field(name="🎯 Slots", value=f"{num_slots}", inline=True)
-
-    # Show multiplier preview
-    mult_preview = " ".join(f"{mult}x" for mult in multipliers[:8])
-    if len(multipliers) > 8:
-        mult_preview += "..."
-    embed.add_field(name="📈 Multipliers", value=mult_preview, inline=True)
-    embed.add_field(name="🎮 Instructions", value="Click 'Drop Ball!' to start the animation!", inline=False)
-    embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Higher risk = higher potential rewards!")
-
-    view = PlinkoAnimationView(ball_path, multipliers, rows, num_slots, wager_ltc, wager_usd, ltc_price, user_id, risk)
-    await ctx.respond(embed=embed, view=view)
-
-# KENO
-@bot.slash_command(name="keno", description="Pick numbers and see how many match! (in USD)")
-async def keno(ctx, wager_usd: float, numbers: str):
-    user_id = str(ctx.author.id)
-    init_user(user_id)
-
-    # Get current LTC price
-    ltc_price = await get_ltc_to_usd()
-    wager_ltc = wager_usd / ltc_price
-
-    if balances[user_id]["balance"] < wager_ltc:
-        current_balance_usd = balances[user_id]["balance"] * ltc_price
-        await ctx.respond(f"❌ You don't have enough balance! You have ${current_balance_usd:.2f} USD but tried to wager ${wager_usd:.2f} USD.")
-        return
-
-    # Parse user numbers
-    try:
-        user_numbers = [int(x.strip()) for x in numbers.split(',')]
-        user_numbers = list(set(user_numbers))  # Remove duplicates
-
-        # Validate numbers
-        if not all(1 <= num <= 40 for num in user_numbers):
-            await ctx.respond("❌ Numbers must be between 1 and 40!", ephemeral=True)
-            return
-
-        if len(user_numbers) < 1 or len(user_numbers) > 10:
-            await ctx.respond("❌ You must pick between 1 and 10 numbers!", ephemeral=True)
-            return
-
-    except ValueError:
-        await ctx.respond("❌ Invalid format! Use: `/keno 5.00 1,5,10,15,20`", ephemeral=True)
-        return
-
-    # Generate 20 random winning numbers from 1-40
-    winning_numbers = random.sample(range(1, 41), 20)
-
-    # Find matches
-    matches = set(user_numbers) & set(winning_numbers)
-    match_count = len(matches)
-
-    # Keno payout table based on numbers picked and matches (reduced for house edge)
-    payout_table = {
-        1: {1: 2.5},
-        2: {2: 10.0},
-        3: {2: 0.8, 3: 35.0},
-        4: {2: 0.8, 3: 3.0, 4: 85.0},
-        5: {3: 0.8, 4: 9.0, 5: 600.0},
-        6: {3: 0.8, 4: 2.5, 5: 28.0, 6: 1200.0},
-        7: {3: 0.4, 4: 0.8, 5: 5.0, 6: 150.0, 7: 5000.0},
-        8: {4: 1.5, 5: 9.0, 6: 75.0, 7: 1200.0, 8: 7500.0},
-        9: {4: 0.8, 5: 3.0, 6: 35.0, 7: 250.0, 8: 3500.0, 9: 7500.0},
-        10: {5: 1.5, 6: 18.0, 7: 100.0, 8: 750.0, 9: 3200.0, 10: 7500.0}
-    }
-
-    numbers_picked = len(user_numbers)
-    multiplier = payout_table.get(numbers_picked, {}).get(match_count, 0.0)
-
-    if multiplier > 0:
-        # Player wins
-        winnings_ltc = wager_ltc * multiplier
-        balances[user_id]["balance"] += winnings_ltc
-        new_balance_usd = balances[user_id]["balance"] * ltc_price
-        profit_ltc = winnings_ltc - wager_ltc
-        profit_usd = profit_ltc * ltc_price
-        color = 0x00ff00
-        title = "🎱 Keno - YOU WON! 🎉"
-        result_text = f"You matched {match_count} out of {numbers_picked} numbers!\nProfit: ${profit_usd:.2f} USD"
-    else:
-        # Player loses
-        balances[user_id]["balance"] -= wager_ltc
-        new_balance_usd = balances[user_id]["balance"] * ltc_price
-        color = 0xff0000
-        title = "🎱 Keno - No Win 😔"
-        result_text = f"You matched {match_count} out of {numbers_picked} numbers.\nNot enough matches for a payout."
-
-    balances[user_id]["wagered"] += wager_ltc
-    add_rakeback(user_id, wager_ltc)  # Add rakeback
-    save_balances(balances)
-
-    embed = discord.Embed(title=title, color=color)
-    embed.add_field(name="🎯 Result", value=result_text, inline=False)
-    embed.add_field(name="🔢 Your Numbers", value=', '.join(map(str, sorted(user_numbers))), inline=True)
-    embed.add_field(name="✅ Matches", value=', '.join(map(str, sorted(matches))) if matches else "None", inline=True)
-    embed.add_field(name="🎲 Match Count", value=f"{match_count}/{numbers_picked}", inline=True)
-
-    if multiplier > 0:
-        embed.add_field(name="📈 Multiplier", value=f"{multiplier}x", inline=True)
-
-    embed.add_field(name="💰 Wagered", value=f"${wager_usd:.2f} USD", inline=True)
-    embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
-
-    # Show some winning numbers
-    winning_display = ', '.join(map(str, sorted(winning_numbers[:10]))) + f"... (+{len(winning_numbers)-10} more)"
-    embed.add_field(name="🏆 Winning Numbers", value=winning_display, inline=False)
-    embed.set_footer(text=f"LTC Price: ${ltc_price:.2f} • Pick 1-10 numbers from 1-40")
-
-    await ctx.respond(embed=embed)
-
 # TEST COMMAND
 @bot.slash_command(name="test", description="Test if the bot is working")
 async def test(ctx):
@@ -1713,6 +1627,12 @@ async def test(ctx):
 async def sync(ctx):
     if not is_admin(ctx.author.id):
         await ctx.respond("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
         return
 
     try:
