@@ -1,4 +1,47 @@
-
+@bot.slash_command(name="deposit", description="Generate a Litecoin deposit address")
+async def generate_deposit(ctx):
+    user_id = str(ctx.author.id)
+    
+    # Ensure ltc_handler is initialized
+    if not ltc_handler:
+        await ctx.respond("❌ Litecoin deposits are currently unavailable. Please contact an admin.", ephemeral=True)
+        return
+    
+    init_user(user_id)
+    
+    # Generate deposit address
+    deposit_address = await ltc_handler.generate_deposit_address(user_id)
+    
+    if deposit_address:
+        # Send detailed DM with deposit instructions
+        embed = discord.Embed(
+            title="🪙 Litecoin deposit",
+            description="To top up your balance, transfer the desired amount to this address.",
+            color=0xffa500
+        )
+        
+        embed.add_field(
+            name="Please note:",
+            value="1. This is your permanent deposit address.\n2. You can use it as many times as you want.",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Litecoin Address:",
+            value=f"`{deposit_address}`",
+            inline=False
+        )
+        
+        embed.set_footer(text="⚡ All deposits are processed automatically • Keep this address safe")
+        
+        try:
+            # Try to send DM first
+            await ctx.author.send(embed=embed)
+            await ctx.respond("📨 I've sent you a DM with your deposit address and instructions!", ephemeral=True)
+        except discord.Forbidden:
+            await ctx.respond("❌ I couldn't send you a DM. Please enable DMs from server members.", ephemeral=True)
+    else:
+        await ctx.respond("❌ Failed to generate deposit address. Please try again later.", ephemeral=True)
 import discord
 from discord.ext import commands
 import os
@@ -7,10 +50,13 @@ import json
 import aiohttp
 import asyncio
 from dotenv import load_dotenv
+from crypto_handler import init_litecoin_handler, ltc_handler
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_ID").split(",")]
+BLOCKCYPHER_API_KEY = os.getenv("BLOCKCYPHER_API_KEY")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 intents = discord.Intents.default()
 intents.message_content = True  # Enable message content intent
@@ -28,17 +74,7 @@ def save_balances(balances):
     with open("balances.json", "w") as f:
         json.dump(balances, f)
 
-# Load withdraw queue
-def load_withdraw_queue():
-    if not os.path.exists("withdraw_queue.json"):
-        return []
-    with open("withdraw_queue.json", "r") as f:
-        return json.load(f)
 
-# Save withdraw queue
-def save_withdraw_queue(queue):
-    with open("withdraw_queue.json", "w") as f:
-        json.dump(queue, f)
 
 # Load rakeback data
 def load_rakeback_data():
@@ -78,8 +114,11 @@ def check_cooldown(user_id):
     return True, 0
 
 balances = load_balances()
-withdraw_queue = load_withdraw_queue()
 rakeback_data = load_rakeback_data()
+
+# Initialize Litecoin handler
+if BLOCKCYPHER_API_KEY:
+    init_litecoin_handler(BLOCKCYPHER_API_KEY, WEBHOOK_SECRET)
 
 # Rakeback system constants
 RAKEBACK_PERCENTAGE = 0.005  # 0.5%
@@ -335,8 +374,8 @@ async def coinflip(ctx, choice: discord.Option(str, "Choose heads or tails", cho
     won = coin_flip == choice
 
     if won:
-        # 90% RTP - pay out 0.90x for wins (10% house edge)
-        winnings_usd = wager_usd * 0.90
+        # 80% RTP - pay out 0.80x for wins (20% house edge)
+        winnings_usd = wager_usd * 0.80
         balances[user_id]["balance"] += winnings_usd
         new_balance_usd = balances[user_id]["balance"]
         color = 0x00ff00
@@ -381,8 +420,8 @@ async def dice(ctx, wager_usd: float):
     won = roll > 3
 
     if won:
-        # 85% RTP - pay out 0.85x for wins (15% house edge)
-        winnings_usd = wager_usd * 0.85
+        # 75% RTP - pay out 0.75x for wins (25% house edge)
+        winnings_usd = wager_usd * 0.75
         balances[user_id]["balance"] += winnings_usd
         new_balance_usd = balances[user_id]["balance"]
         color = 0x00ff00
@@ -438,8 +477,8 @@ async def rps(ctx, choice: discord.Option(str, "Your choice", choices=["rock", "
         title = "🤝 Rock Paper Scissors - It's a Tie!"
         result_text = f"You both chose **{choice}** {choice_emojis[choice]}!"
     elif win_map[choice] == bot_choice:
-        # Player wins - 88% RTP (12% house edge)
-        winnings_usd = wager_usd * 0.88
+        # Player wins - 78% RTP (22% house edge)
+        winnings_usd = wager_usd * 0.78
         balances[user_id]["balance"] += winnings_usd
         new_balance_usd = balances[user_id]["balance"]
         color = 0x00ff00
@@ -486,8 +525,8 @@ async def slots(ctx, wager_usd: float):
     result_display = " ".join(result)
 
     if len(set(result)) == 1:
-        # JACKPOT - all 3 match (reduced to 3x for higher house edge)
-        multiplier = 3.0
+        # JACKPOT - all 3 match (reduced to 2x for higher house edge)
+        multiplier = 2.0
         winnings_usd = wager_usd * multiplier
         balances[user_id]["balance"] += winnings_usd
         new_balance_usd = balances[user_id]["balance"]
@@ -495,8 +534,8 @@ async def slots(ctx, wager_usd: float):
         title = "🎰 JACKPOT! 💰🎉"
         result_text = f"**{result_display}**\n\nAll three match! You won **${winnings_usd:.2f} USD** (4x multiplier)!"
     elif len(set(result)) == 2:
-        # Two symbols match (reduced to 1.2x for higher house edge)
-        multiplier = 1.2
+        # Two symbols match (reduced to 1.0x for higher house edge)
+        multiplier = 1.0
         winnings_usd = wager_usd * multiplier
         balances[user_id]["balance"] += winnings_usd
         new_balance_usd = balances[user_id]["balance"]
@@ -519,194 +558,11 @@ async def slots(ctx, wager_usd: float):
     embed.add_field(name="🎯 Result", value=result_text, inline=False)
     embed.add_field(name="💰 Wagered", value=f"${wager_usd:.2f} USD", inline=True)
     embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
-    embed.set_footer(text="Jackpot: 3x | Two Match: 1.2x")
+    embed.set_footer(text="Jackpot: 2x | Two Match: 1.0x")
 
     await ctx.respond(embed=embed)
 
-# WITHDRAW
-@bot.slash_command(name="withdraw", description="Withdraw your balance to your crypto address")
-async def withdraw(ctx, amount_usd: float, crypto_address: str):
-    user_id = str(ctx.author.id)
-    init_user(user_id)
 
-    # Check cooldown
-    can_proceed, remaining_time = check_cooldown(user_id)
-    if not can_proceed:
-        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
-        return
-
-    if balances[user_id]["balance"] < amount_usd:
-        current_balance_usd = balances[user_id]["balance"]
-        await ctx.respond(f"❌ You don't have enough balance! You have ${current_balance_usd:.2f} USD but tried to withdraw ${amount_usd:.2f} USD.")
-        return
-
-    # Basic crypto address validation (basic length check)
-    if len(crypto_address) < 26:
-        await ctx.respond("❌ Invalid crypto address format!", ephemeral=True)
-        return
-
-    # Add to withdraw queue
-    import datetime
-    withdraw_request = {
-        "user_id": user_id,
-        "username": ctx.author.display_name,
-        "amount_usd": amount_usd,
-        "crypto_address": crypto_address,
-        "timestamp": datetime.datetime.now().isoformat()
-    }
-
-    withdraw_queue.append(withdraw_request)
-    save_withdraw_queue(withdraw_queue)
-
-    # Deduct from balance
-    balances[user_id]["balance"] -= amount_usd
-    balances[user_id]["withdrawn"] += amount_usd
-    save_balances(balances)
-
-    embed = discord.Embed(
-        title="📤 Withdrawal Request Submitted",
-        color=0x00ff00
-    )
-    embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
-    embed.add_field(name="📍 Address", value=f"`{crypto_address}`", inline=False)
-    embed.add_field(name="⏰ Status", value="Pending admin approval", inline=True)
-    embed.set_footer(text="Your withdrawal will be processed by an admin shortly.")
-
-    await ctx.respond(embed=embed)
-    await log_withdraw(ctx.author, amount_usd, crypto_address)
-
-
-# ADMIN: QUEUE
-@bot.slash_command(name="queue", description="Admin command to view pending withdrawals")
-async def queue(ctx):
-    if not is_admin(ctx.author.id):
-        await ctx.respond("You do not have permission to use this command.", ephemeral=True)
-        return
-
-    if not withdraw_queue:
-        await ctx.respond("✅ No pending withdrawals!")
-        return
-
-    embed = discord.Embed(
-        title="📋 Pending Withdrawal Queue",
-        color=0xffaa00
-    )
-
-    for i, request in enumerate(withdraw_queue, 1):
-        embed.add_field(
-            name=f"#{i} - {request['username']}",
-            value=f"**Amount:** ${request['amount_usd']:.2f} USD\n"
-                  f"**Address:** `{request['crypto_address']}`\n"
-                  f"**Time:** {request['timestamp'][:19]}",
-            inline=False
-        )
-
-    embed.set_footer(text=f"Total requests: {len(withdraw_queue)}")
-    await ctx.respond(embed=embed)
-
-# ADMIN: CONFIRM DEPOSIT
-@bot.slash_command(name="confirmdeposit", description="Admin command to confirm a user's deposit")
-async def confirmdeposit(ctx, member: discord.Member, amount_usd: float):
-    if not is_admin(ctx.author.id):
-        await ctx.respond("You do not have permission to use this command.", ephemeral=True)
-        return
-
-    # Check cooldown
-    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
-    if not can_proceed:
-        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
-        return
-
-    user_id = str(member.id)
-    init_user(user_id)
-
-    balances[user_id]["deposited"] += amount_usd # Correctly adds to deposited stats
-    balances[user_id]["balance"] += amount_usd # Add to actual balance
-    save_balances(balances)
-
-    embed = discord.Embed(
-        title="✅ Deposit Confirmed",
-        color=0x00ff00
-    )
-    embed.add_field(name="👤 User", value=member.display_name, inline=True)
-    embed.add_field(name="💵 Deposit Amount", value=f"${amount_usd:.2f} USD", inline=True)
-    embed.add_field(name="📊 Total Deposited", value=f"${balances[user_id]['deposited']:.2f} USD", inline=True)
-
-    await ctx.respond(embed=embed)
-
-    # Log the deposit
-    await log_deposit(member, amount_usd)
-
-# ADMIN: CONFIRM WITHDRAW
-@bot.slash_command(name="confirmwithdraw", description="Admin command to confirm a withdrawal (remove from queue)")
-async def confirmwithdraw(ctx, queue_number: int):
-    if not is_admin(ctx.author.id):
-        await ctx.respond("You do not have permission to use this command.", ephemeral=True)
-        return
-
-    # Check cooldown
-    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
-    if not can_proceed:
-        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
-        return
-
-    if not withdraw_queue or queue_number < 1 or queue_number > len(withdraw_queue):
-        await ctx.respond("❌ Invalid queue number!", ephemeral=True)
-        return
-
-    # Remove from queue (convert to 0-based index)
-    confirmed_request = withdraw_queue.pop(queue_number - 1)
-    save_withdraw_queue(withdraw_queue)
-
-    embed = discord.Embed(
-        title="✅ Withdrawal Confirmed & Processed",
-        color=0x00ff00
-    )
-    embed.add_field(name="👤 User", value=confirmed_request['username'], inline=True)
-    embed.add_field(name="💵 Amount", value=f"${confirmed_request['amount_usd']:.2f} USD", inline=True)
-    embed.add_field(name="📍 Address", value=f"`{confirmed_request['crypto_address']}`", inline=False)
-    embed.set_footer(text="Withdrawal has been processed and removed from queue.")
-
-    await ctx.respond(embed=embed)
-
-# ADMIN: CANCEL WITHDRAW
-@bot.slash_command(name="cancelwithdraw", description="Admin command to cancel a withdrawal by queue number")
-async def cancelwithdraw(ctx, queue_number: int):
-    if not is_admin(ctx.author.id):
-        await ctx.respond("You do not have permission to use this command.", ephemeral=True)
-        return
-
-    # Check cooldown
-    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
-    if not can_proceed:
-        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
-        return
-
-    if not withdraw_queue or queue_number < 1 or queue_number > len(withdraw_queue):
-        await ctx.respond("❌ Invalid queue number!", ephemeral=True)
-        return
-
-    # Remove from queue (convert to 0-based index)
-    cancelled_request = withdraw_queue.pop(queue_number - 1)
-    save_withdraw_queue(withdraw_queue)
-
-    # Return balance to user and adjust stats
-    user_id = cancelled_request['user_id']
-    init_user(user_id)
-    balances[user_id]["balance"] += cancelled_request['amount_usd']
-    balances[user_id]["withdrawn"] -= cancelled_request['amount_usd']
-    save_balances(balances)
-
-    embed = discord.Embed(
-        title="🚫 Withdrawal Cancelled by Admin",
-        color=0xffaa00
-    )
-    embed.add_field(name="👤 User", value=cancelled_request['username'], inline=True)
-    embed.add_field(name="💵 Amount Returned", value=f"${cancelled_request['amount_usd']:.2f} USD", inline=True)
-    embed.add_field(name="📍 Address", value=f"`{cancelled_request['crypto_address']}`", inline=False)
-    embed.set_footer(text="Withdrawal has been cancelled and balance restored to user.")
-
-    await ctx.respond(embed=embed)
 
 # ADMIN: RESET STATS
 @bot.slash_command(name="resetstats", description="Admin command to reset everything about a user including balance")
@@ -737,14 +593,8 @@ async def resetstats(ctx, member: discord.Member):
     }
     save_balances(balances)
 
-    # Also remove any pending withdrawals for this user
-    global withdraw_queue
-    original_queue_length = len(withdraw_queue)
-    withdraw_queue = [req for req in withdraw_queue if req['user_id'] != user_id]
-    removed_withdrawals = original_queue_length - len(withdraw_queue)
-
-    if removed_withdrawals > 0:
-        save_withdraw_queue(withdraw_queue)
+    # Note: Automatic withdrawals are processed immediately, no queue cleanup needed
+    removed_withdrawals = 0
 
     embed = discord.Embed(
         title="🔄 Complete Account Reset",
@@ -753,7 +603,7 @@ async def resetstats(ctx, member: discord.Member):
     embed.add_field(name="👤 User", value=member.display_name, inline=True)
     embed.add_field(name="💳 New Balance", value="$0.00 USD", inline=True)
     embed.add_field(name="📊 Statistics", value="All reset to 0", inline=True)
-    embed.add_field(name="📤 Withdrawals", value=f"{removed_withdrawals} pending withdrawals cancelled", inline=True)
+    embed.add_field(name="📤 Withdrawals", value="No pending withdrawals (automatic processing)", inline=True)
     embed.add_field(name="⚠️ Action", value="**COMPLETE ACCOUNT WIPE**", inline=False)
     embed.set_footer(text="Balance, statistics, and pending withdrawals have been completely reset.")
 
@@ -861,7 +711,7 @@ async def blackjack(ctx, wager_usd: float):
 
     # Interactive blackjack game
     class BlackjackView(discord.ui.View):
-        def __init__(self, player_hand, dealer_hand, deck, wager_usd, user_id, original_wager_usd):
+        def __init__(self, player_hand, dealer_hand, deck, wager_usd, user_id, original_wager_usd, is_split_hand=False, split_hand_index=0, parent_view=None):
             super().__init__(timeout=180)
             self.player_hand = player_hand
             self.dealer_hand = dealer_hand
@@ -871,10 +721,18 @@ async def blackjack(ctx, wager_usd: float):
             self.original_wager_usd = original_wager_usd
             self.game_over = False
             self.can_double_down = True # Flag to track if double down is allowed
+            self.is_split_hand = is_split_hand
+            self.split_hand_index = split_hand_index
+            self.parent_view = parent_view
+            self.can_split = False
+            self.split_hands = []
+            self.current_hand_index = 0
+            
+            # Check if splitting is possible (pair on first two cards)
+            if not is_split_hand and len(player_hand) == 2 and card_value(player_hand[0]) == card_value(player_hand[1]):
+                self.can_split = True
 
-        async def update_message(self, interaction, embed):
-             # Update the message with the new embed and view state
-            await interaction.response.edit_message(embed=embed, view=self)
+        
 
         @discord.ui.button(label="Hit", style=discord.ButtonStyle.green, emoji="🃏")
         async def hit_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -882,18 +740,56 @@ async def blackjack(ctx, wager_usd: float):
                 await interaction.response.send_message("This is not your game!", ephemeral=True)
                 return
 
-            # Player hits
+            # Handle split hands
+            if self.split_hands:
+                current_hand = self.split_hands[self.current_hand_index]
+                current_hand.append(self.deck.pop())
+                hand_value_num = hand_value(current_hand)
+                
+                # Once player hits, double down and split are no longer options
+                self.can_double_down = False
+                self.can_split = False
+                for item in self.children:
+                    if hasattr(item, 'label') and item.label in ["Double Down", "Split"]:
+                        item.disabled = True
+                        item.style = discord.ButtonStyle.gray
+
+                if hand_value_num > 21:
+                    # Current split hand busts, move to next hand
+                    await self.play_next_split_hand(interaction)
+                else:
+                    # Update embed with current split hand - highlight active hand
+                    hand1_display = f"{format_hand(self.split_hands[0])} = {hand_value(self.split_hands[0])}"
+                    hand2_display = f"{format_hand(self.split_hands[1])} = {hand_value(self.split_hands[1])}"
+                    
+                    # Add indicators to show which hand is active
+                    if self.current_hand_index == 0:
+                        hand1_display = f"🔥 **{hand1_display}** 🔥"
+                    else:
+                        hand2_display = f"🔥 **{hand2_display}** 🔥"
+                    
+                    embed = discord.Embed(title=f"🃏 Blackjack - Playing Split Hand {self.current_hand_index + 1}/2", color=0x0099ff)
+                    embed.add_field(name="🃏 Hand 1", value=hand1_display, inline=True)
+                    embed.add_field(name="🃏 Hand 2", value=hand2_display, inline=True)
+                    embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand, hide_first=True)} = ?", inline=True)
+                    embed.add_field(name="💰 Total Wager", value=f"${self.wager_usd * 2:.2f} USD", inline=True)
+                    embed.add_field(name="🎯 Current Action", value=f"Playing Hand {self.current_hand_index + 1}", inline=True)
+                    embed.set_footer(text=f"🔥 = Currently Playing | Hit or Stand for Hand {self.current_hand_index + 1}")
+                    
+                    await interaction.response.edit_message(embed=embed, view=self)
+                return
+
+            # Regular single hand logic
             self.player_hand.append(self.deck.pop())
             player_value = hand_value(self.player_hand)
 
-            # Once player hits, double down is no longer an option
+            # Once player hits, double down and split are no longer options
             self.can_double_down = False
-            # Disable double down button if it exists and player hits
+            self.can_split = False
             for item in self.children:
-                if hasattr(item, 'label') and item.label == "Double Down":
+                if hasattr(item, 'label') and item.label in ["Double Down", "Split"]:
                     item.disabled = True
                     item.style = discord.ButtonStyle.gray
-                    break
 
             if player_value > 21:
                 # Player busts (wager already deducted when game started)
@@ -912,7 +808,7 @@ async def blackjack(ctx, wager_usd: float):
 
                 self.game_over = True
                 self.clear_items()  # Only clear buttons when game ends
-                await self.update_message(interaction, embed)
+                await interaction.response.edit_message(embed=embed, view=self)
             else:
                 # Update the embed with new hand - player can continue hitting or stand
                 embed = discord.Embed(title="🃏 Blackjack - Your Turn", color=0x0099ff)
@@ -921,7 +817,7 @@ async def blackjack(ctx, wager_usd: float):
                 embed.add_field(name="💰 Wager", value=f"${self.wager_usd:.2f} USD", inline=True)
                 embed.set_footer(text="Hit: take another card | Stand: keep hand")
 
-                await self.update_message(interaction, embed)
+                await interaction.response.edit_message(embed=embed, view=self)
 
         @discord.ui.button(label="Stand", style=discord.ButtonStyle.red, emoji="✋")
         async def stand_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -929,9 +825,15 @@ async def blackjack(ctx, wager_usd: float):
                 await interaction.response.send_message("This is not your game!", ephemeral=True)
                 return
 
+            # Handle split hands
+            if self.split_hands:
+                # Move to next split hand
+                await self.play_next_split_hand(interaction)
+                return
+
             # Player stands, dealer plays
             player_value = hand_value(self.player_hand)
-            
+
             # Clear buttons first
             self.clear_items()
 
@@ -940,9 +842,9 @@ async def blackjack(ctx, wager_usd: float):
             embed.add_field(name="🃏 Your Hand", value=f"{format_hand(self.player_hand)} = {player_value}", inline=True)
             embed.add_field(name="🤖 Dealer Reveals...", value=f"{format_hand(self.dealer_hand)} = {hand_value(self.dealer_hand)}", inline=True)
             embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
-            
+
             await interaction.response.edit_message(embed=embed, view=self)
-            
+
             # Add delay for suspense
             await asyncio.sleep(2)
 
@@ -950,13 +852,13 @@ async def blackjack(ctx, wager_usd: float):
             while hand_value(self.dealer_hand) < 17:
                 self.dealer_hand.append(self.deck.pop())
                 current_dealer_value = hand_value(self.dealer_hand)
-                
+
                 # Show each new card
                 embed = discord.Embed(title="🃏 Blackjack - Dealer Hits", color=0xffaa00)
                 embed.add_field(name="🃏 Your Hand", value=f"{format_hand(self.player_hand)} = {player_value}", inline=True)
                 embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand)} = {current_dealer_value}", inline=True)
                 embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
-                
+
                 await interaction.edit_original_response(embed=embed, view=self)
                 await asyncio.sleep(1.5)  # Pause between each card
 
@@ -964,15 +866,15 @@ async def blackjack(ctx, wager_usd: float):
 
             # Determine winner
             if dealer_value > 21:
-                # Dealer busts, player wins (92% RTP - 8% house edge)
-                winnings = self.wager_usd + (self.wager_usd * 0.92)
+                # Dealer busts, player wins (82% RTP - 18% house edge)
+                winnings = self.wager_usd + (self.wager_usd * 0.82)
                 balances[self.user_id]["balance"] += winnings
                 color = 0x00ff00
                 title = "🃏 Blackjack - YOU WON! 🎉"
                 result_text = f"Dealer busted with {dealer_value}!"
             elif player_value > dealer_value:
-                # Player wins (92% RTP - 8% house edge)
-                winnings = self.wager_usd + (self.wager_usd * 0.92)
+                # Player wins (82% RTP - 18% house edge)
+                winnings = self.wager_usd + (self.wager_usd * 0.82)
                 balances[self.user_id]["balance"] += winnings
                 color = 0x00ff00
                 title = "🃏 Blackjack - YOU WON! 🎉"
@@ -1004,6 +906,210 @@ async def blackjack(ctx, wager_usd: float):
             self.game_over = True
             await interaction.edit_original_response(embed=embed, view=self)
 
+        @discord.ui.button(label="Split", style=discord.ButtonStyle.blurple, emoji="✂️")
+        async def split_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+            if interaction.user.id != int(self.user_id) or self.game_over:
+                await interaction.response.send_message("This is not your game!", ephemeral=True)
+                return
+
+            if not self.can_split:
+                await interaction.response.send_message("You can only split pairs!", ephemeral=True)
+                return
+
+            # Check if user has enough balance for the additional wager
+            if balances[self.user_id]["balance"] < self.wager_usd:
+                current_balance_usd = balances[self.user_id]["balance"]
+                await interaction.response.send_message(f"❌ Insufficient balance! You have ${current_balance_usd:.2f} USD but need ${self.wager_usd:.2f} USD to split.", ephemeral=True)
+                return
+
+            # Deduct additional wager for split
+            balances[self.user_id]["balance"] -= self.wager_usd
+            save_balances(balances)
+
+            # Split the hand
+            hand1 = [self.player_hand[0]]
+            hand2 = [self.player_hand[1]]
+
+            # Deal one card to each split hand
+            hand1.append(self.deck.pop())
+            hand2.append(self.deck.pop())
+
+            self.split_hands = [hand1, hand2]
+            self.current_hand_index = 0
+            self.can_split = False
+            self.can_double_down = True  # Can double down after split
+
+            # Disable split button and update other buttons
+            for item in self.children:
+                if hasattr(item, 'label') and item.label == "Split":
+                    item.disabled = True
+                    item.style = discord.ButtonStyle.gray
+                    break
+
+            # Check if first split hand has blackjack
+            if hand_value(hand1) == 21:
+                # Auto-stand on blackjack, move to second hand
+                await self.play_next_split_hand(interaction)
+                return
+
+            # Update embed for first split hand with clear indicators
+            hand1_display = f"🔥 **{format_hand(hand1)} = {hand_value(hand1)}** 🔥"
+            hand2_display = f"{format_hand(hand2)} = {hand_value(hand2)}"
+            
+            embed = discord.Embed(title="🃏 Blackjack - Playing Split Hand 1/2", color=0x0099ff)
+            embed.add_field(name="🃏 Hand 1", value=hand1_display, inline=True)
+            embed.add_field(name="🃏 Hand 2", value=hand2_display, inline=True)
+            embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand, hide_first=True)} = ?", inline=True)
+            embed.add_field(name="💰 Total Wager", value=f"${self.wager_usd * 2:.2f} USD", inline=True)
+            embed.add_field(name="🎯 Current Action", value="Playing Hand 1", inline=True)
+            embed.set_footer(text="🔥 = Currently Playing | Hit, Stand, or Double Down for Hand 1")
+
+            await interaction.response.edit_message(embed=embed, view=self)
+
+        async def play_next_split_hand(self, interaction):
+            """Handle transition between split hands"""
+            self.current_hand_index += 1
+            
+            if self.current_hand_index >= len(self.split_hands):
+                # All split hands played, dealer plays
+                await self.play_dealer_for_split(interaction)
+                return
+            
+            # Move to next hand
+            current_hand = self.split_hands[self.current_hand_index]
+            self.can_double_down = True
+            
+            # Re-enable buttons for next hand
+            for item in self.children:
+                if hasattr(item, 'label') and item.label in ["Hit", "Stand"]:
+                    item.disabled = False
+                if hasattr(item, 'label') and item.label == "Double Down":
+                    item.disabled = False
+                    item.style = discord.ButtonStyle.blurple
+            
+            # Check if this hand has blackjack
+            if hand_value(current_hand) == 21:
+                # Auto-stand on blackjack, move to next hand
+                await self.play_next_split_hand(interaction)
+                return
+            
+            # Update embed for next split hand with clear indicators
+            hand1_display = f"{format_hand(self.split_hands[0])} = {hand_value(self.split_hands[0])}"
+            hand2_display = f"{format_hand(self.split_hands[1])} = {hand_value(self.split_hands[1])}"
+            
+            # Add indicators to show which hand is active
+            if self.current_hand_index == 0:
+                hand1_display = f"🔥 **{hand1_display}** 🔥"
+            else:
+                hand2_display = f"🔥 **{hand2_display}** 🔥"
+            
+            embed = discord.Embed(title=f"🃏 Blackjack - Playing Split Hand {self.current_hand_index + 1}/2", color=0x0099ff)
+            embed.add_field(name="🃏 Hand 1", value=hand1_display, inline=True)
+            embed.add_field(name="🃏 Hand 2", value=hand2_display, inline=True)
+            embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand, hide_first=True)} = ?", inline=True)
+            embed.add_field(name="💰 Total Wager", value=f"${self.wager_usd * 2:.2f} USD", inline=True)
+            embed.add_field(name="🎯 Current Action", value=f"Playing Hand {self.current_hand_index + 1}", inline=True)
+            embed.set_footer(text=f"🔥 = Currently Playing | Hit, Stand, or Double Down for Hand {self.current_hand_index + 1}")
+
+            await interaction.response.edit_message(embed=embed, view=self)
+
+        async def play_dealer_for_split(self, interaction):
+            """Play dealer against split hands"""
+            self.clear_items()
+            
+            # Dealer plays
+            embed = discord.Embed(title="🃏 Blackjack - Dealer's Turn (Split)", color=0xffaa00)
+            embed.add_field(name="🃏 Hand 1 Final", value=f"{format_hand(self.split_hands[0])} = {hand_value(self.split_hands[0])}", inline=True)
+            embed.add_field(name="🃏 Hand 2 Final", value=f"{format_hand(self.split_hands[1])} = {hand_value(self.split_hands[1])}", inline=True)
+            embed.add_field(name="🤖 Dealer Reveals...", value=f"{format_hand(self.dealer_hand)} = {hand_value(self.dealer_hand)}", inline=True)
+            embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
+            
+            await interaction.response.edit_message(embed=embed, view=self)
+            await asyncio.sleep(2)
+            
+            # Dealer hits until 17 or higher
+            while hand_value(self.dealer_hand) < 17:
+                self.dealer_hand.append(self.deck.pop())
+                current_dealer_value = hand_value(self.dealer_hand)
+                
+                embed = discord.Embed(title="🃏 Blackjack - Dealer Hits (Split)", color=0xffaa00)
+                embed.add_field(name="🃏 Hand 1 Final", value=f"{format_hand(self.split_hands[0])} = {hand_value(self.split_hands[0])}", inline=True)
+                embed.add_field(name="🃏 Hand 2 Final", value=f"{format_hand(self.split_hands[1])} = {hand_value(self.split_hands[1])}", inline=True)
+                embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand)} = {current_dealer_value}", inline=True)
+                embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
+                
+                await interaction.edit_original_response(embed=embed, view=self)
+                await asyncio.sleep(1.5)
+            
+            # Determine results for both hands
+            dealer_value = hand_value(self.dealer_hand)
+            results = []
+            total_winnings = 0
+            
+            for i, hand in enumerate(self.split_hands):
+                hand_value_num = hand_value(hand)
+                hand_num = i + 1
+                
+                if hand_value_num > 21:
+                    # Hand busted
+                    results.append(f"Hand {hand_num}: BUST ({hand_value_num}) - Lost ${self.wager_usd:.2f}")
+                elif hand_value_num == 21 and len(hand) == 2:
+                    # Blackjack on split (pays 1.5x)
+                    if dealer_value == 21:
+                        # Push with dealer blackjack
+                        balances[self.user_id]["balance"] += self.wager_usd
+                        results.append(f"Hand {hand_num}: BLACKJACK PUSH - Returned ${self.wager_usd:.2f}")
+                    else:
+                        winnings = self.wager_usd + (self.wager_usd * 1.5)
+                        balances[self.user_id]["balance"] += winnings
+                        total_winnings += self.wager_usd * 1.5
+                        results.append(f"Hand {hand_num}: BLACKJACK! - Won ${self.wager_usd * 1.5:.2f}")
+                elif dealer_value > 21:
+                    # Dealer busts, hand wins
+                    winnings = self.wager_usd + (self.wager_usd * 0.82)
+                    balances[self.user_id]["balance"] += winnings
+                    total_winnings += self.wager_usd * 0.82
+                    results.append(f"Hand {hand_num}: WIN (Dealer bust) - Won ${self.wager_usd * 0.82:.2f}")
+                elif hand_value_num > dealer_value:
+                    # Hand wins
+                    winnings = self.wager_usd + (self.wager_usd * 0.82)
+                    balances[self.user_id]["balance"] += winnings
+                    total_winnings += self.wager_usd * 0.82
+                    results.append(f"Hand {hand_num}: WIN ({hand_value_num} vs {dealer_value}) - Won ${self.wager_usd * 0.82:.2f}")
+                elif dealer_value > hand_value_num:
+                    # Dealer wins
+                    results.append(f"Hand {hand_num}: LOSE ({hand_value_num} vs {dealer_value}) - Lost ${self.wager_usd:.2f}")
+                else:
+                    # Push
+                    balances[self.user_id]["balance"] += self.wager_usd
+                    results.append(f"Hand {hand_num}: PUSH ({hand_value_num}) - Returned ${self.wager_usd:.2f}")
+            
+            # Add wagered amount to stats (total of both hands)
+            balances[self.user_id]["wagered"] += self.wager_usd * 2
+            add_rakeback(self.user_id, self.wager_usd * 2)
+            save_balances(balances)
+            
+            new_balance_usd = balances[self.user_id]["balance"]
+            
+            # Create final results embed
+            if total_winnings > 0:
+                title = "🃏 Split Blackjack - Results! 🎉"
+                color = 0x00ff00
+            else:
+                title = "🃏 Split Blackjack - Results"
+                color = 0xff0000
+            
+            embed = discord.Embed(title=title, color=color)
+            embed.add_field(name="🃏 Hand 1 Final", value=f"{format_hand(self.split_hands[0])} = {hand_value(self.split_hands[0])}", inline=True)
+            embed.add_field(name="🃏 Hand 2 Final", value=f"{format_hand(self.split_hands[1])} = {hand_value(self.split_hands[1])}", inline=True)
+            embed.add_field(name="🤖 Dealer Final", value=f"{format_hand(self.dealer_hand)} = {dealer_value}", inline=True)
+            embed.add_field(name="🎯 Results", value="\n".join(results), inline=False)
+            embed.add_field(name="💰 Total Wagered", value=f"${self.wager_usd * 2:.2f} USD", inline=True)
+            embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
+            
+            self.game_over = True
+            await interaction.edit_original_response(embed=embed, view=self)
+
         @discord.ui.button(label="Double Down", style=discord.ButtonStyle.blurple, emoji="💸")
         async def double_down_button(self, button: discord.ui.Button, interaction: discord.Interaction):
             if interaction.user.id != int(self.user_id) or self.game_over:
@@ -1014,14 +1120,30 @@ async def blackjack(ctx, wager_usd: float):
                 await interaction.response.send_message("You can only double down on your first turn!", ephemeral=True)
                 return
 
-            # Check if user has enough balance for the additional wager (original wager already deducted when game started)
+            # Check if user has enough balance for the additional wager
             if balances[self.user_id]["balance"] < self.wager_usd:
                 current_balance_usd = balances[self.user_id]["balance"]
                 needed_usd = self.wager_usd
                 await interaction.response.send_message(f"❌ Insufficient balance! You have ${current_balance_usd:.2f} USD but need ${needed_usd:.2f} USD to double down.", ephemeral=True)
                 return
 
-            # Player doubles down
+            # Handle split hands
+            if self.split_hands:
+                # Double down on current split hand
+                balances[self.user_id]["balance"] -= self.wager_usd
+                current_hand = self.split_hands[self.current_hand_index]
+                current_hand.append(self.deck.pop())
+                hand_value_num = hand_value(current_hand)
+                
+                self.can_double_down = False
+                self.can_split = False
+                
+                # Update wager for this hand (will be calculated in final results)
+                # Move to next hand after double down
+                await self.play_next_split_hand(interaction)
+                return
+
+            # Player doubles down on single hand
             doubled_wager_usd = self.wager_usd * 2
 
             balances[self.user_id]["balance"] -= self.wager_usd # Remove the additional wager amount for double down
@@ -1055,7 +1177,7 @@ async def blackjack(ctx, wager_usd: float):
                 embed.add_field(name="🃏 Your Hand", value=f"{format_hand(self.player_hand)} = {player_value}", inline=True)
                 embed.add_field(name="🤖 Dealer Reveals...", value=f"{format_hand(self.dealer_hand)} = {hand_value(self.dealer_hand)}", inline=True)
                 embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
-                
+
                 await interaction.edit_original_response(embed=embed, view=self)
                 await asyncio.sleep(2)
 
@@ -1063,13 +1185,13 @@ async def blackjack(ctx, wager_usd: float):
                 while hand_value(self.dealer_hand) < 17:
                     self.dealer_hand.append(self.deck.pop())
                     current_dealer_value = hand_value(self.dealer_hand)
-                    
+
                     # Show each new card
                     embed = discord.Embed(title="🃏 Blackjack - Dealer Hits (Double Down)", color=0xffaa00)
                     embed.add_field(name="🃏 Your Hand", value=f"{format_hand(self.player_hand)} = {player_value}", inline=True)
                     embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand)} = {current_dealer_value}", inline=True)
                     embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
-                    
+
                     await interaction.edit_original_response(embed=embed, view=self)
                     await asyncio.sleep(1.5)
 
@@ -1077,15 +1199,15 @@ async def blackjack(ctx, wager_usd: float):
 
                 # Determine winner
                 if dealer_value > 21:
-                    # Dealer busts, player wins (92% RTP on double down)
-                    winnings = doubled_wager_usd + (doubled_wager_usd * 0.92)
+                    # Dealer busts, player wins (82% RTP on double down)
+                    winnings = doubled_wager_usd + (doubled_wager_usd * 0.82)
                     balances[self.user_id]["balance"] += winnings
                     color = 0x00ff00
                     title = "🃏 Blackjack - YOU WON After Double Down! 🎉"
                     result_text = f"Dealer busted with {dealer_value}! You win ${doubled_wager_usd:.2f} USD."
                 elif player_value > dealer_value:
-                    # Player wins (92% RTP on double down)
-                    winnings = doubled_wager_usd + (doubled_wager_usd * 0.92)
+                    # Player wins (82% RTP on double down)
+                    winnings = doubled_wager_usd + (doubled_wager_usd * 0.82)
                     balances[self.user_id]["balance"] += winnings
                     color = 0x00ff00
                     title = "🃏 Blackjack - YOU WON After Double Down! 🎉"
@@ -1123,7 +1245,13 @@ async def blackjack(ctx, wager_usd: float):
     embed.add_field(name="🃏 Your Hand", value=f"{format_hand(player_hand)} = {player_value}", inline=True)
     embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(dealer_hand, hide_first=True)} = ?", inline=True)
     embed.add_field(name="💰 Wager", value=f"${wager_usd:.2f} USD", inline=True)
-    embed.set_footer(text="Hit: take another card | Stand: keep hand | Double Down: double bet + 1 card") # Updated footer
+    
+    # Check if splitting is possible for footer text
+    can_split_pair = len(player_hand) == 2 and card_value(player_hand[0]) == card_value(player_hand[1])
+    footer_text = "Hit: take another card | Stand: keep hand | Double Down: double bet + 1 card"
+    if can_split_pair:
+        footer_text += " | Split: split pair into 2 hands"
+    embed.set_footer(text=footer_text)
 
     view = BlackjackView(player_hand, dealer_hand, deck, wager_usd, user_id, wager_usd)
     await ctx.respond(embed=embed, view=view)
@@ -1162,7 +1290,7 @@ async def mines(ctx, wager_usd: float, mine_count: discord.Option(int, "Number o
 
         # Base multiplier table similar to Stake.com
         safe_tiles = 25 - total_mines
-        
+
         # Calculate multiplier using probability formula
         # Each safe tile revealed reduces probability of next safe tile
         multiplier = 1.0
@@ -1171,8 +1299,8 @@ async def mines(ctx, wager_usd: float, mine_count: discord.Option(int, "Number o
             remaining_total = 25 - i
             multiplier *= remaining_total / remaining_safe
 
-        # Apply house edge (reduce by ~5% to match Stake)
-        multiplier *= 0.95
+        # Apply house edge (reduce by ~20% for higher house edge)
+        multiplier *= 0.80
 
         return round(multiplier, 2)
 
@@ -1377,7 +1505,7 @@ async def towers(ctx, wager_usd: float, difficulty: discord.Option(int, "Difficu
     def get_tower_multiplier(level, difficulty):
         # Higher levels and higher difficulty = higher multiplier (reduced for higher house edge)
         base_multiplier = 1.0
-        level_bonus = level * (0.15 + (difficulty - 2) * 0.03)
+        level_bonus = level * (0.10 + (difficulty - 2) * 0.02)
         return round(base_multiplier + level_bonus, 2)
 
     class TowersView(discord.ui.View):
@@ -1537,6 +1665,314 @@ async def towers(ctx, wager_usd: float, difficulty: discord.Option(int, "Difficu
 
     view = TowersView(tower_structure, wager_usd, user_id, difficulty)
     await ctx.respond(embed=embed, view=view)
+
+# LEADERBOARD
+@bot.slash_command(name="leaderboard", description="View leaderboards for different categories")
+async def leaderboard(ctx, category: discord.Option(str, "Choose leaderboard category", choices=["balance", "wagered", "deposited", "withdrawn", "profit"])):
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Load current balances
+    current_balances = load_balances()
+    
+    if not current_balances:
+        await ctx.respond("❌ No user data found!", ephemeral=True)
+        return
+
+    # Calculate data based on category
+    leaderboard_data = []
+    
+    for user_id, data in current_balances.items():
+        try:
+            # Get user object for display name
+            user = bot.get_user(int(user_id))
+            display_name = user.display_name if user else f"User #{user_id[-4:]}"
+            
+            if category == "balance":
+                value = data.get("balance", 0.0)
+                leaderboard_data.append((display_name, value))
+            elif category == "wagered":
+                value = data.get("wagered", 0.0)
+                leaderboard_data.append((display_name, value))
+            elif category == "deposited":
+                value = data.get("deposited", 0.0)
+                leaderboard_data.append((display_name, value))
+            elif category == "withdrawn":
+                value = data.get("withdrawn", 0.0)
+                leaderboard_data.append((display_name, value))
+            elif category == "profit":
+                # Calculate profit/loss
+                current_balance = data.get("balance", 0.0)
+                total_withdrawn = data.get("withdrawn", 0.0)
+                total_deposited = data.get("deposited", 0.0)
+                profit_loss = current_balance + total_withdrawn - total_deposited
+                leaderboard_data.append((display_name, profit_loss))
+        except:
+            continue
+
+    # Sort by value (highest first, except for losses in profit category)
+    leaderboard_data.sort(key=lambda x: x[1], reverse=True)
+    
+    # Take top 10
+    top_10 = leaderboard_data[:10]
+    
+    if not top_10:
+        await ctx.respond("❌ No data available for this category!", ephemeral=True)
+        return
+
+    # Create embed based on category
+    category_info = {
+        "balance": {"title": "💰 Current Balance Leaderboard", "emoji": "💳", "color": 0x00ff00},
+        "wagered": {"title": "🎲 Total Wagered Leaderboard", "emoji": "🎯", "color": 0xff6600},
+        "deposited": {"title": "⬇️ Total Deposited Leaderboard", "emoji": "💸", "color": 0x0099ff},
+        "withdrawn": {"title": "⬆️ Total Withdrawn Leaderboard", "emoji": "💰", "color": 0xffaa00},
+        "profit": {"title": "📈 Profit/Loss Leaderboard", "emoji": "📊", "color": 0xffd700}
+    }
+    
+    info = category_info[category]
+    embed = discord.Embed(title=info["title"], color=info["color"])
+    
+    leaderboard_text = ""
+    for i, (name, value) in enumerate(top_10, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        
+        if category == "profit":
+            profit_emoji = "📈" if value >= 0 else "📉"
+            leaderboard_text += f"{medal} **{name}** {profit_emoji} ${value:.2f}\n"
+        else:
+            leaderboard_text += f"{medal} **{name}** {info['emoji']} ${value:.2f}\n"
+    
+    embed.add_field(name=f"🏆 Top {len(top_10)} Players", value=leaderboard_text, inline=False)
+    embed.set_footer(text=f"Category: {category.title()} | Updated in real-time")
+    
+    await ctx.respond(embed=embed)
+
+# GENERATE DEPOSIT ADDRESS
+@bot.slash_command(name="deposit", description="Generate a Litecoin deposit address")
+async def generate_deposit(ctx):
+    user_id = str(ctx.author.id)
+    
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+    
+    if not ltc_handler:
+        await ctx.respond("❌ Litecoin deposits are currently unavailable. Please contact an admin.", ephemeral=True)
+        return
+    
+    init_user(user_id)
+    
+    # Generate deposit address
+    deposit_address = await ltc_handler.generate_deposit_address(user_id)
+    
+    if deposit_address:
+        # Send detailed DM with deposit instructions
+        embed = discord.Embed(
+            title="🪙 Litecoin deposit",
+            description="To top up your balance, transfer the desired amount to this address.",
+            color=0xffa500
+        )
+        
+        embed.add_field(
+            name="Please note:",
+            value="1. This is your permanent deposit address.\n2. You can use it as many times as you want.",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Litecoin Address:",
+            value=f"`{deposit_address}`",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚠️ Important Security Notice",
+            value="• Send **ONLY** Litecoin (LTC) to this address\n• Other cryptocurrencies will be lost permanently\n• Double-check the address before sending",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⏰ Processing Information",
+            value="• Deposits are automatically credited after 1 blockchain confirmation\n• Typical confirmation time: ~2.5 minutes\n• You will receive a notification when processed",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💱 Exchange Rate",
+            value="Deposits are converted to USD at current market rates",
+            inline=False
+        )
+        
+        embed.set_footer(text="⚡ All deposits are processed automatically • Keep this address safe")
+        
+        try:
+            # Try to send DM first
+            await ctx.author.send(embed=embed)
+            # Confirm in channel that DM was sent
+            await ctx.respond("📨 I've sent you a DM with your deposit address and instructions!", ephemeral=True)
+        except discord.Forbidden:
+            # If DM fails, send as ephemeral response
+            await ctx.respond("❌ I couldn't send you a DM. Please enable DMs from server members.", ephemeral=True)
+            await ctx.followup.send(embed=embed, ephemeral=True)
+    else:
+        await ctx.respond("❌ Failed to generate deposit address. Please try again later.", ephemeral=True)
+
+# WITHDRAW
+@bot.slash_command(name="withdraw", description="Withdraw your balance to your Litecoin address")
+async def withdraw(ctx, amount_usd: float, ltc_address: str):
+    user_id = str(ctx.author.id)
+    init_user(user_id)
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    if balances[user_id]["balance"] < amount_usd:
+        current_balance_usd = balances[user_id]["balance"]
+        await ctx.respond(f"❌ You don't have enough balance! You have ${current_balance_usd:.2f} USD but tried to withdraw ${amount_usd:.2f} USD.")
+        return
+
+    # Basic Litecoin address validation
+    if not ltc_address.startswith(('L', 'M', '3')) or len(ltc_address) < 26:
+        await ctx.respond("❌ Invalid Litecoin address format!", ephemeral=True)
+        return
+
+    if not ltc_handler:
+        await ctx.respond("❌ Automatic withdrawals are currently unavailable. Please try again later.", ephemeral=True)
+        return
+
+    # Automatic withdrawal process
+    try:
+        # Get current LTC price (you'd want to implement a proper price feed)
+        ltc_price_usd = await get_ltc_price()  # Implement this function
+        ltc_amount = amount_usd / ltc_price_usd
+
+        # Minimum withdrawal check
+        if ltc_amount < 0.001:
+            await ctx.respond(f"❌ Minimum withdrawal is $1.00 USD (approximately 0.001 LTC)", ephemeral=True)
+            return
+
+        # Process withdrawal
+        tx_hash = await ltc_handler.send_litecoin(ltc_address, ltc_amount, "master_private_key")  # Use your master wallet
+
+        if tx_hash:
+            # Successful withdrawal
+            balances[user_id]["balance"] -= amount_usd
+            balances[user_id]["withdrawn"] += amount_usd
+            save_balances(balances)
+
+            embed = discord.Embed(
+                title="✅ Litecoin Withdrawal Successful! 🎉",
+                color=0x00ff00
+            )
+            embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+            embed.add_field(name="🪙 LTC Amount", value=f"{ltc_amount:.6f} LTC", inline=True)
+            embed.add_field(name="📍 Address", value=f"`{ltc_address}`", inline=False)
+            embed.add_field(name="🧾 Transaction Hash", value=f"`{tx_hash}`", inline=False)
+            embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+            embed.set_footer(text="⚡ Withdrawal processed automatically!")
+
+            await ctx.respond(embed=embed)
+            await log_withdraw(ctx.author, amount_usd, ltc_address)
+        else:
+            await ctx.respond("❌ Withdrawal failed. Please try again later or contact an admin.", ephemeral=True)
+
+    except Exception as e:
+        print(f"Withdrawal error: {e}")
+        await ctx.respond("❌ Withdrawal failed due to technical error. Please contact an admin.", ephemeral=True)
+
+# HELP
+@bot.slash_command(name="help", description="View all available game modes and commands")
+async def help_command(ctx):
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(ctx.author.id))
+    if not can_proceed:
+        await ctx.respond(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🎮 VaultBet - Game Modes & Commands",
+        description="Welcome to VaultBet! Here are all the available games and commands:",
+        color=0x00ff00
+    )
+    
+    # Game Modes Section
+    games_text = """
+🪙 **Coinflip** - `/coinflip [heads/tails] [amount]`
+Call heads or tails and double your money! (80% RTP)
+
+🎲 **Dice Roll** - `/dice [amount]`
+Roll a dice and win if it's over 3! (75% RTP)
+
+🤜 **Rock Paper Scissors** - `/rps [choice] [amount]`
+Classic game against the bot! (78% RTP)
+
+🎰 **Slots** - `/slots [amount]`
+Spin the reels for jackpots and multipliers!
+
+🃏 **Blackjack** - `/blackjack [amount]`
+Beat the dealer with strategy! Hit, Stand, Double Down, or Split pairs.
+
+💎 **Mines** - `/mines [amount] [mine_count]`
+Find diamonds while avoiding mines! Cash out anytime.
+
+🏗️ **Towers** - `/towers [amount] [difficulty]`
+Climb 8 levels by choosing correct paths! Higher risk = higher reward.
+    """
+    
+    embed.add_field(name="🎯 Available Games", value=games_text, inline=False)
+    
+    # Account Commands Section
+    account_text = """
+💰 `/balance` - Check your account stats and balance
+💸 `/tip [user] [amount]` - Send money to another player
+🎁 `/claimrakeback` - Claim 0.5% of your total wagered
+📤 `/withdraw [amount] [address]` - Withdraw to crypto address
+🏆 `/leaderboard [category]` - View top players in different categories
+    """
+    
+    embed.add_field(name="💳 Account Commands", value=account_text, inline=False)
+    
+    # Game Info Section
+    info_text = """
+💡 **Tips:**
+• All games have built-in house edge for fair play
+• Earn 0.5% rakeback on everything you wager
+• Blackjack pays 1.5x for natural blackjack
+• Use splitting and doubling strategies in Blackjack
+• Mines and Towers let you cash out anytime for current winnings
+
+⚡ **RTP (Return to Player):**
+Coinflip: 80% | Dice: 75% | RPS: 78% | Blackjack: 82%+ | Slots: Variable
+    """
+    
+    embed.add_field(name="ℹ️ Game Information", value=info_text, inline=False)
+    
+    embed.set_footer(text="🎲 Good luck and gamble responsibly! | All amounts in USD")
+    embed.set_thumbnail(url="https://i.imgur.com/placeholder.png")  # You can replace with an actual image URL
+    
+    await ctx.respond(embed=embed)
+
+async def get_ltc_price():
+    """Get current Litecoin price in USD"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data['litecoin']['usd']
+                else:
+                    return 75.0  # Fallback price
+    except:
+        return 75.0  # Fallback price
 
 # TEST COMMAND
 @bot.slash_command(name="test", description="Test if the bot is working")
