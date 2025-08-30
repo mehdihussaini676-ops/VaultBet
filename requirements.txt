@@ -1,6 +1,5 @@
 py-cord>=2.4.0
 python-dotenv
 aiohttp
-discord-py
 flask
 pycryptodome
