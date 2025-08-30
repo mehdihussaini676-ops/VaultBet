@@ -2,100 +2,179 @@
 from flask import Flask, request, jsonify
 import json
 import asyncio
-import discord
-from main import balances, save_balances, init_user, log_deposit, bot
-from crypto_handler import ltc_handler
-import threading
+import os
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
+
+# Load balances function
+def load_balances():
+    if not os.path.exists("balances.json"):
+        return {}
+    with open("balances.json", "r") as f:
+        return json.load(f)
+
+# Save balances function
+def save_balances(balances):
+    with open("balances.json", "w") as f:
+        json.dump(balances, f)
+
+# Initialize user function
+def init_user(user_id, balances):
+    if user_id not in balances:
+        balances[user_id] = {"balance": 0.0, "deposited": 0.0, "withdrawn": 0.0, "wagered": 0.0}
+
+async def get_ltc_price():
+    """Get current Litecoin price in USD"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data['litecoin']['usd']
+                else:
+                    return 75.0  # Fallback price
+    except:
+        return 75.0  # Fallback price
 
 @app.route('/webhook/litecoin', methods=['POST'])
 def litecoin_webhook():
     try:
-        # Verify webhook signature
-        signature = request.headers.get('X-BlockCypher-Signature', '')
-        if ltc_handler and not ltc_handler.verify_webhook(request.data, signature):
-            return jsonify({"error": "Invalid signature"}), 403
+        data = request.get_json()
+        print(f"Received webhook: {data}")
 
-        data = request.json
-        
-        # Process only confirmed transactions (wait for blockchain confirmation)
-        if data.get('event') == 'confirmed-tx' and data.get('confirmations', 0) >= 1:
-            tx = data.get('transaction', {})
-            
-            # Check if this is a deposit (incoming transaction)
-            for output in tx.get('outputs', []):
-                for address in output.get('addresses', []):
-                    # Load address mappings
-                    try:
-                        with open("crypto_addresses.json", "r") as f:
-                            mappings = json.load(f)
+        # Load address mappings
+        try:
+            with open('crypto_addresses.json', 'r') as f:
+                mappings = json.load(f)
+        except FileNotFoundError:
+            print("No address mappings found")
+            return jsonify({'error': 'No address mappings found'}), 404
+
+        tx_hash = data['hash']
+        event_type = data.get('event')
+        outputs = data.get('outputs', [])
+
+        # Process each output to find relevant addresses
+        for output in outputs:
+            for address in output.get('addresses', []):
+                if address in mappings:
+                    user_id = mappings[address]['user_id']
+                    amount_satoshis = output['value']
+                    amount_ltc = amount_satoshis / 100000000
+
+                    print(f"Processing {event_type} transaction: {amount_ltc} LTC for user {user_id}")
+
+                    if event_type == 'unconfirmed-tx':
+                        # Handle unconfirmed transaction - notify user but don't credit balance yet
+                        print(f"Unconfirmed transaction detected: {tx_hash} - {amount_ltc} LTC")
                         
-                        if address in mappings:
-                            # This is a deposit to one of our generated addresses
-                            user_id = mappings[address]['user_id']
+                        # Store transaction for monitoring
+                        try:
+                            with open('pending_transactions.json', 'r') as f:
+                                pending = json.load(f)
+                        except FileNotFoundError:
+                            pending = {}
                             
-                            # Calculate USD value
-                            ltc_amount = output['value'] / 100000000  # Convert satoshis to LTC
-                            usd_value = ltc_amount * get_ltc_price_sync()  # Implement sync version
-                            
-                            # Credit user's balance
-                            init_user(user_id)
-                            balances[user_id]['balance'] += usd_value
-                            balances[user_id]['deposited'] += usd_value
-                            save_balances(balances)
-                            
-                            # Notify user
-                            asyncio.create_task(notify_deposit(user_id, usd_value, ltc_amount, tx['hash']))
-                            
-                            print(f"Processed deposit: {ltc_amount} LTC (${usd_value:.2f}) for user {user_id}")
-                    except Exception as e:
-                        print(f"Error processing webhook: {e}")
-        
-        return jsonify({"status": "success"}), 200
-    
+                        pending[tx_hash] = {
+                            'user_id': user_id,
+                            'address': address,
+                            'amount_ltc': amount_ltc,
+                            'timestamp': data.get('received', ''),
+                            'confirmed': False
+                        }
+                        
+                        with open('pending_transactions.json', 'w') as f:
+                            json.dump(pending, f, indent=2)
+
+                        # Import and call handler if available
+                        try:
+                            from crypto_handler import ltc_handler
+                            if ltc_handler:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
+                                    loop.run_until_complete(
+                                        ltc_handler.handle_unconfirmed_transaction(data, user_id, address, amount_ltc)
+                                    )
+                                finally:
+                                    loop.close()
+                        except Exception as e:
+                            print(f"Error notifying user of unconfirmed transaction: {e}")
+
+                    elif event_type == 'confirmed-tx':
+                        # Handle confirmed transaction - credit balance and notify user
+                        
+                        # Get current LTC price
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            ltc_price = loop.run_until_complete(get_ltc_price())
+                        finally:
+                            loop.close()
+
+                        # Convert LTC to USD
+                        amount_usd = amount_ltc * ltc_price
+
+                        print(f"Processing confirmed deposit: {amount_ltc} LTC (${amount_usd:.2f}) for user {user_id}")
+
+                        # Load and update user balance
+                        balances = load_balances()
+                        init_user(user_id, balances)
+                        balances[user_id]['balance'] += amount_usd
+                        balances[user_id]['deposited'] += amount_usd
+                        save_balances(balances)
+
+                        print(f"Updated balance for user {user_id}: ${balances[user_id]['balance']:.2f}")
+
+                        # Update pending transactions
+                        try:
+                            with open('pending_transactions.json', 'r') as f:
+                                pending = json.load(f)
+                            if tx_hash in pending:
+                                pending[tx_hash]['confirmed'] = True
+                                with open('pending_transactions.json', 'w') as f:
+                                    json.dump(pending, f, indent=2)
+                        except FileNotFoundError:
+                            pass
+
+                        # Notify user of confirmation
+                        try:
+                            from crypto_handler import ltc_handler
+                            if ltc_handler:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
+                                    tx_info = {
+                                        'user_id': user_id,
+                                        'amount_ltc': amount_ltc
+                                    }
+                                    loop.run_until_complete(
+                                        ltc_handler.handle_confirmed_transaction(tx_hash, data, tx_info)
+                                    )
+                                finally:
+                                    loop.close()
+                        except Exception as e:
+                            print(f"Error notifying user of confirmed transaction: {e}")
+
+        return jsonify({'status': 'success'})
+
     except Exception as e:
         print(f"Webhook error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({'error': 'Internal server error'}), 500
 
-async def notify_deposit(user_id: str, usd_value: float, ltc_amount: float, tx_hash: str):
-    """Notify user of successful deposit"""
-    try:
-        user = bot.get_user(int(user_id))
-        if user:
-            embed = discord.Embed(
-                title="✅ Your deposit of {:.8f} LTC confirmed and credited!".format(ltc_amount),
-                color=0x00ff00
-            )
-            embed.add_field(name="🪙 Litecoin Amount", value=f"{ltc_amount:.8f} LTC", inline=True)
-            embed.add_field(name="💵 USD Value", value=f"${usd_value:.2f}", inline=True)
-            embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
-            embed.add_field(name="🧾 Transaction Hash", value=f"`{tx_hash[:16]}...{tx_hash[-16:]}`", inline=False)
-            embed.add_field(name="🎮 Ready to Play!", value="Your balance has been updated. You can now use all game commands!", inline=False)
-            embed.set_footer(text="⚡ Deposit automatically processed • Transaction confirmed on blockchain")
-            
-            try:
-                await user.send(embed=embed)
-            except:
-                pass  # User has DMs disabled
-                
-            # Also log to deposit channel
-            member = bot.get_user(int(user_id))
-            if member:
-                await log_deposit(member, usd_value)
-                
-    except Exception as e:
-        print(f"Error notifying deposit: {e}")
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'})
 
-def get_ltc_price_sync():
-    """Get current LTC price synchronously"""
-    # Implement actual price fetching
-    return 75.0  # Placeholder price
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({'message': 'VaultBet Webhook Server', 'status': 'running'})
 
-def run_webhook_server():
-    app.run(host='0.0.0.0', port=5000, debug=False)
-
-# Start webhook server in separate thread
-if __name__ == "__main__":
-    webhook_thread = threading.Thread(target=run_webhook_server, daemon=True)
-    webhook_thread.start()
+if __name__ == '__main__':
+    print("Starting webhook server on port 5000...")
+    app.run(host='0.0.0.0', port=5000, debug=True)
