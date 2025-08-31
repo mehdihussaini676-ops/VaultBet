@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 import json
 import asyncio
@@ -45,14 +44,21 @@ async def get_ltc_price():
 def litecoin_webhook():
     try:
         data = request.get_json()
-        print(f"Received webhook: {data}")
+        print(f"=== WEBHOOK RECEIVED ===")
+        print(f"Raw data: {data}")
+        print(f"Request headers: {dict(request.headers)}")
+
+        if not data:
+            print("ERROR: No JSON data received")
+            return jsonify({'error': 'No data received'}), 400
 
         # Load address mappings
         try:
             with open('crypto_addresses.json', 'r') as f:
                 mappings = json.load(f)
+            print(f"Loaded {len(mappings)} address mappings")
         except FileNotFoundError:
-            print("No address mappings found")
+            print("ERROR: No address mappings found")
             return jsonify({'error': 'No address mappings found'}), 404
 
         tx_hash = data['hash']
@@ -72,14 +78,14 @@ def litecoin_webhook():
                     if event_type == 'unconfirmed-tx':
                         # Handle unconfirmed transaction - notify user but don't credit balance yet
                         print(f"Unconfirmed transaction detected: {tx_hash} - {amount_ltc} LTC")
-                        
+
                         # Store transaction for monitoring
                         try:
                             with open('pending_transactions.json', 'r') as f:
                                 pending = json.load(f)
                         except FileNotFoundError:
                             pending = {}
-                            
+
                         pending[tx_hash] = {
                             'user_id': user_id,
                             'address': address,
@@ -87,7 +93,7 @@ def litecoin_webhook():
                             'timestamp': data.get('received', ''),
                             'confirmed': False
                         }
-                        
+
                         with open('pending_transactions.json', 'w') as f:
                             json.dump(pending, f, indent=2)
 
@@ -108,7 +114,7 @@ def litecoin_webhook():
 
                     elif event_type == 'confirmed-tx':
                         # Handle confirmed transaction - credit balance and notify user
-                        
+
                         # Get current LTC price
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
@@ -161,6 +167,26 @@ def litecoin_webhook():
                         except Exception as e:
                             print(f"Error notifying user of confirmed transaction: {e}")
 
+                        # Forward funds to house wallet after a short delay
+                        await asyncio.sleep(15)  # Wait 15 seconds for confirmation to settle
+
+                        # Get deposit address private key for forwarding
+                        try:
+                            with open("crypto_addresses.json", "r") as f:
+                                mappings = json.load(f)
+                                if address in mappings:
+                                    private_key = mappings[address]["private_key"]
+
+                                    # Forward to house wallet
+                                    forward_tx = await ltc_handler.forward_to_house_wallet(address, private_key, amount_ltc)
+                                    if forward_tx:
+                                        print(f"✅ Successfully forwarded {amount_ltc:.6f} LTC to house wallet: {forward_tx}")
+                                    else:
+                                        print(f"❌ Failed to forward deposit to house wallet")
+                        except Exception as e:
+                            print(f"❌ Error forwarding to house wallet: {e}")
+
+
         return jsonify({'status': 'success'})
 
     except Exception as e:
@@ -174,6 +200,32 @@ def health_check():
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({'message': 'VaultBet Webhook Server', 'status': 'running'})
+
+@app.route('/test-webhook', methods=['POST', 'GET'])
+def test_webhook():
+    """Test endpoint to verify webhook is working"""
+    if request.method == 'POST':
+        data = request.get_json()
+        print(f"Test webhook received: {data}")
+        return jsonify({'status': 'success', 'received': data})
+    else:
+        return jsonify({'message': 'Send POST request with JSON data to test webhook'})
+
+@app.route('/status', methods=['GET'])
+def status():
+    """Status endpoint to check server health and mappings"""
+    try:
+        with open('crypto_addresses.json', 'r') as f:
+            mappings = json.load(f)
+        address_count = len(mappings)
+    except FileNotFoundError:
+        address_count = 0
+
+    return jsonify({
+        'status': 'running',
+        'addresses_tracked': address_count,
+        'webhook_url': 'https://vaultbot-gambling.replit.app/webhook/litecoin'
+    })
 
 if __name__ == '__main__':
     print("Starting webhook server on port 5000...")
