@@ -1,4 +1,3 @@
-
 import aiohttp
 import asyncio
 import json
@@ -24,19 +23,19 @@ class LitecoinHandler:
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/addrs"
                 params = {"token": self.api_key}
-                
+
                 async with session.post(url, params=params) as response:
                     if response.status == 201:
                         data = await response.json()
                         address = data["address"]
                         private_key = data["private"]
-                        
+
                         # Store the address mapping
                         await self.store_address_mapping(user_id, address, private_key)
-                        
+
                         # Set up webhook
                         await self.setup_webhook(address)
-                        
+
                         return address
                     else:
                         print(f"Failed to generate address: {response.status}")
@@ -90,13 +89,25 @@ class LitecoinHandler:
                     url = f"{self.base_url}/hooks"
                     async with session.post(url, json=webhook_data, params=params) as response:
                         if response.status == 201:
-                            print(f"Webhook set up for address {address} - event: {webhook_data['event']}")
+                            webhook_response = await response.json()
+                            print(f"✅ Webhook set up for address {address} - event: {webhook_data['event']}")
+                            print(f"   Webhook ID: {webhook_response.get('id', 'Unknown')}")
                         else:
-                            print(f"Failed to set up webhook: {response.status}")
+                            error_text = await response.text()
+                            print(f"❌ Failed to set up webhook for {webhook_data['event']}: HTTP {response.status}")
+                            print(f"   Error: {error_text}")
+
+                            # Try to parse error response
+                            try:
+                                error_data = json.loads(error_text)
+                                if 'error' in error_data:
+                                    print(f"   API Error: {error_data['error']}")
+                            except:
+                                pass
 
                 # Add to monitoring set
                 self.monitoring_addresses.add(address)
-                
+
         except Exception as e:
             print(f"Error setting up webhook: {e}")
 
@@ -116,23 +127,23 @@ class LitecoinHandler:
                 async with aiohttp.ClientSession() as session:
                     url = f"{self.base_url}/addrs"
                     params = {"token": self.api_key}
-                    
+
                     async with session.post(url, params=params) as response:
                         if response.status == 201:
                             data = await response.json()
                             self.house_wallet_address = data["address"]
                             self.house_wallet_private_key = data["private"]
-                            
+
                             # Save house wallet
                             house_data = {
                                 "address": self.house_wallet_address,
                                 "private_key": self.house_wallet_private_key,  # ENCRYPT IN PRODUCTION
                                 "created_at": asyncio.get_event_loop().time()
                             }
-                            
+
                             with open("house_wallet.json", "w") as f:
                                 json.dump(house_data, f, indent=2)
-                            
+
                             print(f"Created new house wallet: {self.house_wallet_address}")
                             return True
                         else:
@@ -153,13 +164,13 @@ class LitecoinHandler:
         if not self.house_wallet_address:
             print("House wallet not initialized")
             return None
-            
+
         try:
             # Calculate fee and amount to send
             fee_satoshis = 1000  # ~0.00001 LTC
             amount_satoshis = int(amount_ltc * 100000000)
             amount_to_send = amount_satoshis - fee_satoshis
-            
+
             if amount_to_send <= 0:
                 print("Amount too small to forward after fees")
                 return None
@@ -170,14 +181,14 @@ class LitecoinHandler:
                     "inputs": [{"addresses": [from_address]}],
                     "outputs": [{"addresses": [self.house_wallet_address], "value": amount_to_send}]
                 }
-                
+
                 url = f"{self.base_url}/txs/new"
                 params = {"token": self.api_key}
-                
+
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
-                        
+
                         # Sign and send transaction (simplified for demo)
                         send_url = f"{self.base_url}/txs/send"
                         async with session.post(send_url, json=tx_skeleton, params=params) as send_response:
@@ -185,7 +196,7 @@ class LitecoinHandler:
                                 result = await send_response.json()
                                 print(f"Forwarded {amount_ltc:.6f} LTC to house wallet: {result['tx']['hash']}")
                                 return result["tx"]["hash"]
-                                
+
                 return None
         except Exception as e:
             print(f"Error forwarding to house wallet: {e}")
@@ -196,19 +207,19 @@ class LitecoinHandler:
         if not self.house_wallet_address or not self.house_wallet_private_key:
             print("House wallet not initialized")
             return None
-            
+
         try:
             # Check house balance
             house_balance = await self.get_house_balance()
             if house_balance < amount_ltc:
                 print(f"Insufficient house balance: {house_balance:.6f} LTC < {amount_ltc:.6f} LTC")
                 return None
-                
+
             # Calculate fee and amount to send
             fee_satoshis = 1000  # ~0.00001 LTC
             amount_satoshis = int(amount_ltc * 100000000)
             amount_to_send = amount_satoshis - fee_satoshis
-            
+
             if amount_to_send <= 0:
                 print("Amount too small after fees")
                 return None
@@ -219,14 +230,14 @@ class LitecoinHandler:
                     "inputs": [{"addresses": [self.house_wallet_address]}],
                     "outputs": [{"addresses": [to_address], "value": amount_to_send}]
                 }
-                
+
                 url = f"{self.base_url}/txs/new"
                 params = {"token": self.api_key}
-                
+
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
-                        
+
                         # Sign and send transaction (simplified for demo)
                         send_url = f"{self.base_url}/txs/send"
                         async with session.post(send_url, json=tx_skeleton, params=params) as send_response:
@@ -234,7 +245,7 @@ class LitecoinHandler:
                                 result = await send_response.json()
                                 print(f"Withdrew {amount_ltc:.6f} LTC from house wallet: {result['tx']['hash']}")
                                 return result["tx"]["hash"]
-                                
+
                 return None
         except Exception as e:
             print(f"Error withdrawing from house wallet: {e}")
@@ -244,13 +255,13 @@ class LitecoinHandler:
         """Verify webhook signature"""
         if not self.webhook_secret:
             return True  # Skip verification if no secret is set
-        
+
         expected_signature = hmac.new(
             self.webhook_secret.encode(),
             payload,
             hashlib.sha256
         ).hexdigest()
-        
+
         return hmac.compare_digest(signature, expected_signature)
 
     async def get_ltc_to_usd_rate(self) -> float:
@@ -288,14 +299,14 @@ class LitecoinHandler:
         try:
             # Get current balance
             balance_ltc = await self.get_address_balance(address)
-            
+
             if balance_ltc < 0.001:  # Minimum amount to sweep
                 return None
-                
+
             # Calculate fee (simplified - use proper fee estimation in production)
             fee_satoshis = 1000  # ~0.00001 LTC
             amount_to_send = int((balance_ltc * 100000000) - fee_satoshis)
-            
+
             if amount_to_send <= 0:
                 return None
 
@@ -305,25 +316,25 @@ class LitecoinHandler:
                     "inputs": [{"addresses": [address]}],
                     "outputs": [{"addresses": [main_wallet_address], "value": amount_to_send}]
                 }
-                
+
                 url = f"{self.base_url}/txs/new"
                 params = {"token": self.api_key}
-                
+
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
-                        
-                        # Sign transaction (simplified - use proper signing in production)
+
+                        # Sign transaction (simplified for demo)
                         # This is where you'd use the private key to sign
                         # For production, use a proper crypto library like bitcoinlib
-                        
+
                         # Send signed transaction
                         send_url = f"{self.base_url}/txs/send"
                         async with session.post(send_url, json=tx_skeleton, params=params) as send_response:
                             if send_response.status == 201:
                                 result = await send_response.json()
                                 return result["tx"]["hash"]
-                                
+
                 return None
         except Exception as e:
             print(f"Error sweeping address: {e}")
@@ -332,20 +343,20 @@ class LitecoinHandler:
     async def collect_all_deposits(self, main_wallet_address: str) -> Dict[str, Any]:
         """Collect crypto from all user deposit addresses to main wallet"""
         results = {"success": [], "failed": [], "total_collected": 0.0}
-        
+
         try:
             # Load address mappings
             with open("crypto_addresses.json", "r") as f:
                 mappings = json.load(f)
-                
+
             for address, data in mappings.items():
                 try:
                     private_key = data["private_key"]
                     balance = await self.get_address_balance(address)
-                    
+
                     if balance >= 0.001:  # Only sweep if minimum amount
                         tx_hash = await self.sweep_address_to_main_wallet(address, private_key, main_wallet_address)
-                        
+
                         if tx_hash:
                             results["success"].append({
                                 "address": address,
@@ -355,13 +366,13 @@ class LitecoinHandler:
                             results["total_collected"] += balance
                         else:
                             results["failed"].append({"address": address, "reason": "Transaction failed"})
-                    
+
                 except Exception as e:
                     results["failed"].append({"address": address, "reason": str(e)})
-                    
+
         except FileNotFoundError:
             results["failed"].append({"error": "No address mappings found"})
-            
+
         return results
 
     async def get_transaction_details(self, tx_hash: str) -> Optional[Dict]:
@@ -395,12 +406,12 @@ class LitecoinHandler:
                 tx_details = await self.get_transaction_details(tx_hash)
                 if tx_details:
                     confirmations = tx_details.get('confirmations', 0)
-                    
+
                     if confirmations >= 1 and not tx_info.get('confirmed'):
                         # Transaction confirmed
                         await self.handle_confirmed_transaction(tx_hash, tx_details, tx_info)
                         self.pending_transactions[tx_hash]['confirmed'] = True
-                        
+
             except Exception as e:
                 print(f"Error checking transaction {tx_hash}: {e}")
 
@@ -452,7 +463,7 @@ class LitecoinHandler:
             user_id = tx_info['user_id']
             amount_ltc = tx_info['amount_ltc']
             deposit_address = tx_info['address']
-            
+
             user = self.bot.get_user(int(user_id))
             if not user:
                 return
@@ -463,14 +474,14 @@ class LitecoinHandler:
 
             # Forward funds to house wallet after a short delay
             await asyncio.sleep(10)  # Wait 10 seconds for confirmation to settle
-            
+
             # Get deposit address private key for forwarding
             try:
                 with open("crypto_addresses.json", "r") as f:
                     mappings = json.load(f)
                     if deposit_address in mappings:
                         private_key = mappings[deposit_address]["private_key"]
-                        
+
                         # Forward to house wallet
                         forward_tx = await self.forward_to_house_wallet(deposit_address, private_key, amount_ltc)
                         if forward_tx:
