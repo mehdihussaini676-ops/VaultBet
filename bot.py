@@ -6,13 +6,17 @@ import random
 import json
 import aiohttp
 import asyncio    
-from dotenv import load_dotenv
-
-load_dotenv()
+# Load environment variables directly from os.environ (works with Replit Secrets)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_ID", "").split(",") if id.strip()]
 BLOCKCYPHER_API_KEY = os.getenv("BLOCKCYPHER_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+
+# Debug: Print if keys are loaded
+print(f"Environment check:")
+print(f"- Discord token: {'✅' if TOKEN else '❌'}")
+print(f"- BlockCypher key: {'✅' if BLOCKCYPHER_API_KEY else '❌'}")
+print(f"- Webhook secret: {'✅' if WEBHOOK_SECRET else '❌'}")
 
 # Set up intents for Discord bot
 intents = discord.Intents.default()
@@ -59,12 +63,26 @@ def save_rakeback_data(data):
     with open("rakeback.json", "w") as f:
         json.dump(data, f)
 
+# Load affiliation data
+def load_affiliation_data():
+    if not os.path.exists("affiliations.json"):
+        return {}
+    with open("affiliations.json", "r") as f:
+        return json.load(f)
+
+# Save affiliation data
+def save_affiliation_data(data):
+    with open("affiliations.json", "w") as f:
+        json.dump(data, f)
+
 # Initialize user
 def init_user(user_id):
     if user_id not in balances:
         balances[user_id] = {"balance": 0.0, "deposited": 0.0, "withdrawn": 0.0, "wagered": 0.0}
     if user_id not in rakeback_data:
         rakeback_data[user_id] = {"total_wagered": 0.0, "rakeback_earned": 0.0}
+    if user_id not in affiliation_data:
+        affiliation_data[user_id] = {"affiliated_to": None, "total_earned": 0.0}
 
 # Check if user is admin
 def is_admin(user_id):
@@ -86,16 +104,45 @@ def check_cooldown(user_id):
 
 balances = load_balances()
 rakeback_data = load_rakeback_data()
+affiliation_data = load_affiliation_data()
 
 # Rakeback system constants
 RAKEBACK_PERCENTAGE = 0.005  # 0.5%
 
-# Add rakeback to a user's total wagered amount
+# Affiliation system constants
+AFFILIATION_PERCENTAGE = 0.005  # 0.5%
+
+# Add rakeback to a user's total wagered amount and handle affiliations
 def add_rakeback(user_id, wager_amount_usd):
     init_user(user_id)
     rakeback_data[user_id]["total_wagered"] += wager_amount_usd
     rakeback_data[user_id]["rakeback_earned"] += wager_amount_usd * RAKEBACK_PERCENTAGE
     save_rakeback_data(rakeback_data)
+    
+    # Handle affiliation payout
+    handle_affiliation_payout(user_id, wager_amount_usd)
+
+# Handle affiliation payouts
+def handle_affiliation_payout(user_id, wager_amount_usd):
+    # Check if user is affiliated to someone
+    if user_id in affiliation_data and affiliation_data[user_id]["affiliated_to"]:
+        affiliate_id = affiliation_data[user_id]["affiliated_to"]
+        
+        # Calculate affiliate commission
+        commission_usd = wager_amount_usd * AFFILIATION_PERCENTAGE
+        
+        # Initialize affiliate if needed
+        init_user(affiliate_id)
+        
+        # Add commission to affiliate's balance
+        balances[affiliate_id]["balance"] += commission_usd
+        affiliation_data[affiliate_id]["total_earned"] += commission_usd
+        
+        # Save data
+        save_balances(balances)
+        save_affiliation_data(affiliation_data)
+        
+        print(f"Affiliate payout: ${commission_usd:.4f} USD to user {affiliate_id} from user {user_id}'s wager")
 
 # Logging functions for deposit and withdraw channels
 async def log_deposit(member, amount_usd):
@@ -154,29 +201,60 @@ async def on_ready():
     # Initialize Litecoin handler with bot instance
     if BLOCKCYPHER_API_KEY and not ltc_handler:
         try:
+            print(f"🔄 Initializing crypto handler...")
+            print(f"   API Key: {BLOCKCYPHER_API_KEY[:8]}...{BLOCKCYPHER_API_KEY[-4:]}")
+            print(f"   Webhook Secret: {'✅ Set' if WEBHOOK_SECRET else '❌ Missing'}")
+            
             from crypto_handler import init_litecoin_handler
             ltc_handler = init_litecoin_handler(BLOCKCYPHER_API_KEY, WEBHOOK_SECRET, bot)
             
+            print(f"✅ Crypto handler created")
+
             # Initialize house wallet
             house_wallet_initialized = await ltc_handler.initialize_house_wallet()
             if house_wallet_initialized:
-                print(f"House wallet initialized: {ltc_handler.house_wallet_address}")
+                print(f"✅ House wallet initialized: {ltc_handler.house_wallet_address}")
             else:
-                print("Failed to initialize house wallet")
-            
-            # Start blockchain monitoring in background
-            asyncio.create_task(ltc_handler.start_blockchain_monitoring())
-            print("Crypto handler initialized and blockchain monitoring started")
-        except ImportError:
-            print("Warning: crypto_handler not available")
+                print("❌ Failed to initialize house wallet")
+                ltc_handler = None
+
+            if ltc_handler:
+                # Start blockchain monitoring in background
+                asyncio.create_task(ltc_handler.start_blockchain_monitoring())
+                print("✅ Blockchain monitoring started")
+                
+                # Also start the webhook server in a separate thread
+                import threading
+                from webhook_server import app as webhook_app
+                
+                def run_webhook():
+                    webhook_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+                
+                webhook_thread = threading.Thread(target=run_webhook, daemon=True)
+                webhook_thread.start()
+                print("✅ Webhook server started on port 5000")
+                
+        except ImportError as e:
+            print(f"❌ Warning: crypto_handler not available - {e}")
             ltc_handler = None
+        except Exception as e:
+            print(f"❌ Error initializing crypto handler: {e}")
+            import traceback
+            traceback.print_exc()
+            ltc_handler = None
+    elif not BLOCKCYPHER_API_KEY:
+        print("❌ BLOCKCYPHER_API_KEY not found in environment variables")
+        print("   Make sure it's properly set in Replit Secrets")
+        ltc_handler = None
+    else:
+        print("✅ Crypto handler already initialized")
 
 # BALANCE
 @bot.tree.command(name="balance", description="Check your or another user's USD balance and statistics")
 async def balance(interaction: discord.Interaction, user: discord.Member = None):
     if user is None:
         user = interaction.user
-    
+
     user_id = str(user.id)
     init_user(user_id)
 
@@ -200,7 +278,26 @@ async def balance(interaction: discord.Interaction, user: discord.Member = None)
     embed.add_field(name="⬆️ Total Withdrawn", value=f"${total_withdrawn_usd:.2f} USD", inline=True)
     embed.add_field(name="🎲 Total Wagered", value=f"${total_wagered_usd:.2f} USD", inline=True)
     embed.add_field(name=f"{profit_loss_emoji} Profit/Loss", value=f"${profit_loss_usd:.2f} USD", inline=True)
-    embed.add_field(name="📊 Win Rate", value="Coming Soon!", inline=True)
+    
+    # Show affiliation info
+    if user_id in affiliation_data:
+        affiliated_to = affiliation_data[user_id]["affiliated_to"]
+        total_earned = affiliation_data[user_id]["total_earned"]
+        
+        if affiliated_to:
+            try:
+                affiliate_user = bot.get_user(int(affiliated_to))
+                affiliate_name = affiliate_user.display_name if affiliate_user else f"User #{affiliated_to[-4:]}"
+                embed.add_field(name="🤝 Affiliated To", value=affiliate_name, inline=True)
+            except:
+                embed.add_field(name="🤝 Affiliated To", value="Unknown User", inline=True)
+        else:
+            embed.add_field(name="🤝 Affiliated To", value="None", inline=True)
+            
+        embed.add_field(name="💰 Affiliate Earnings", value=f"${total_earned:.2f} USD", inline=True)
+    else:
+        embed.add_field(name="🤝 Affiliated To", value="None", inline=True)
+        embed.add_field(name="💰 Affiliate Earnings", value="$0.00 USD", inline=True)
 
     embed.set_footer(text="Use gambling commands to start playing!")
 
@@ -355,10 +452,14 @@ async def resetstats(interaction: discord.Interaction, member: discord.Member = 
         # Reset all server stats
         balances.clear()
         save_balances(balances)
-        
+
         # Also clear rakeback data
         rakeback_data.clear()
         save_rakeback_data(rakeback_data)
+        
+        # Also clear affiliation data
+        affiliation_data.clear()
+        save_affiliation_data(affiliation_data)
 
         embed = discord.Embed(
             title="🔄 COMPLETE SERVER RESET",
@@ -389,13 +490,18 @@ async def resetstats(interaction: discord.Interaction, member: discord.Member = 
         "withdrawn": 0.0,
         "wagered": 0.0
     }
-    
+
     # Also reset their rakeback data
     if user_id in rakeback_data:
         rakeback_data[user_id] = {"total_wagered": 0.0, "rakeback_earned": 0.0}
-    
+        
+    # Also reset their affiliation data
+    if user_id in affiliation_data:
+        affiliation_data[user_id] = {"affiliated_to": None, "total_earned": 0.0}
+
     save_balances(balances)
     save_rakeback_data(rakeback_data)
+    save_affiliation_data(affiliation_data)
 
     embed = discord.Embed(
         title="🔄 Complete Account Reset",
@@ -468,8 +574,8 @@ async def coinflip(interaction: discord.Interaction, choice: str, wager_usd: flo
     await interaction.response.send_message(embed=embed)
 
 # DICE
-@bot.tree.command(name="dice", description="Roll a dice and win if it's over 3 (in USD)")
-async def dice(interaction: discord.Interaction, wager_usd: float):
+@bot.tree.command(name="dice", description="Roll a dice and choose over/under 3 to win (in USD)")
+async def dice(interaction: discord.Interaction, wager_usd: float, choice: str):
     user_id = str(interaction.user.id)
     init_user(user_id)
 
@@ -477,6 +583,10 @@ async def dice(interaction: discord.Interaction, wager_usd: float):
     can_proceed, remaining_time = check_cooldown(user_id)
     if not can_proceed:
         await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    if choice.lower() not in ["over", "under"]:
+        await interaction.response.send_message("❌ Please choose either 'over' or 'under'!", ephemeral=True)
         return
 
     if wager_usd <= 0:
@@ -493,7 +603,15 @@ async def dice(interaction: discord.Interaction, wager_usd: float):
         return
 
     roll = random.randint(1, 6)
-    won = roll > 3
+    user_choice = choice.lower()
+    
+    # Determine win condition based on choice
+    if user_choice == "over":
+        won = roll > 3
+        win_condition = ">3"
+    else:  # under
+        won = roll < 4  # rolls 1, 2, or 3
+        win_condition = "<4"
 
     if won:
         # 75% RTP - pay out 0.75x for wins (25% house edge)
@@ -502,13 +620,13 @@ async def dice(interaction: discord.Interaction, wager_usd: float):
         new_balance_usd = balances[user_id]["balance"]
         color = 0x00ff00
         title = "🎲 Dice Roll - YOU WON! 🎉"
-        result_text = f"You rolled a **{roll}** (needed >3 to win)!"
+        result_text = f"You rolled a **{roll}** and chose **{user_choice}** ({win_condition})!"
     else:
         balances[user_id]["balance"] -= wager_usd
         new_balance_usd = balances[user_id]["balance"]
         color = 0xff0000
         title = "🎲 Dice Roll - You Lost 😔"
-        result_text = f"You rolled a **{roll}** (needed >3 to win)."
+        result_text = f"You rolled a **{roll}** and chose **{user_choice}** ({win_condition})."
 
     balances[user_id]["wagered"] += wager_usd
     add_rakeback(user_id, wager_usd)
@@ -777,11 +895,11 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             self.user_id = user_id
             self.game_over = False
             self.can_double_down = True
-            self.can_split = self.check_can_split()
             self.current_hand_index = 0
             self.hands_completed = [False]  # Track which hands are done
             self.split_count = 0
             self.total_wager = wager_usd
+            self.can_split = self.check_can_split()
 
         def check_can_split(self):
             if len(self.player_hands[0]) == 2 and self.split_count < 3:
@@ -821,7 +939,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             if player_value > 21:
                 # Current hand busts
                 self.hands_completed[self.current_hand_index] = True
-                
+
                 if all(self.hands_completed):
                     # All hands are done
                     await self.finish_game(interaction)
@@ -905,12 +1023,12 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             # Split the hand
             current_hand = self.get_current_hand()
             card1, card2 = current_hand[0], current_hand[1]
-            
+
             # Create two new hands
             self.player_hands[self.current_hand_index] = [card1, self.deck.pop()]
             self.player_hands.append([card2, self.deck.pop()])
             self.hands_completed.append(False)
-            
+
             self.split_count += 1
             self.can_split = False
             self.can_double_down = True
@@ -944,22 +1062,39 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             embed.add_field(name="🃏 Your Hands", value=self.format_all_hands(), inline=False)
             embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand, hide_first=True)} = ?", inline=True)
             embed.add_field(name="💰 Total Wager", value=f"${self.total_wager:.2f} USD", inline=True)
-            
+
             if len(self.player_hands) > 1:
                 embed.add_field(name="👉 Current Hand", value=f"Hand {self.current_hand_index + 1}", inline=True)
-            
+
             embed.set_footer(text="Hit: take card | Stand: keep hand | Double Down: double bet + 1 card | Split: split pairs")
-            await interaction.response.edit_message(embed=embed, view=self)
+            try:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(embed=embed, view=self)
+                else:
+                    await interaction.response.edit_message(embed=embed, view=self)
+            except discord.errors.NotFound:
+                try:
+                    await interaction.followup.send(embed=embed, view=self)
+                except:
+                    pass
 
         async def dealer_play(self, interaction):
             self.clear_items()
-            
+
             embed = discord.Embed(title="🃏 Blackjack - Dealer's Turn", color=0xffaa00)
             embed.add_field(name="🃏 Your Final Hands", value=self.format_all_hands(), inline=False)
             embed.add_field(name="🤖 Dealer Reveals...", value=f"{format_hand(self.dealer_hand)} = {hand_value(self.dealer_hand)}", inline=True)
             embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
 
-            await interaction.response.edit_message(embed=embed, view=self)
+            try:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(embed=embed, view=self)
+                else:
+                    await interaction.response.edit_message(embed=embed, view=self)
+            except discord.errors.NotFound:
+                await interaction.followup.send(embed=embed, view=self)
+                return
+            
             await asyncio.sleep(2)
 
             while hand_value(self.dealer_hand) < 17:
@@ -971,7 +1106,11 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
                 embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand)} = {current_dealer_value}", inline=True)
                 embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
 
-                await interaction.edit_original_response(embed=embed, view=self)
+                try:
+                    await interaction.edit_original_response(embed=embed, view=self)
+                except discord.errors.NotFound:
+                    # Interaction expired during dealer play
+                    break
                 await asyncio.sleep(1.5)
 
             await self.finish_game(interaction)
@@ -980,11 +1119,11 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             dealer_value = hand_value(self.dealer_hand)
             results = []
             total_winnings = 0
-            
+
             for i, hand in enumerate(self.player_hands):
                 player_value = hand_value(hand)
                 hand_wager = self.wager_usd * (2 if len(hand) > 2 and player_value <= 21 else 1)  # Double down detection
-                
+
                 if player_value > 21:
                     results.append(f"Hand {i+1}: BUST ({player_value}) - Lost ${hand_wager:.2f}")
                 elif dealer_value > 21:
@@ -1005,7 +1144,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             balances[self.user_id]["wagered"] += self.total_wager
             add_rakeback(self.user_id, self.total_wager)
             save_balances(balances)
-            
+
             new_balance_usd = balances[self.user_id]["balance"]
             net_result = total_winnings - self.total_wager
 
@@ -1021,10 +1160,18 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
 
             self.game_over = True
-            if hasattr(interaction, 'edit_original_response'):
-                await interaction.edit_original_response(embed=embed, view=self)
-            else:
-                await interaction.response.edit_message(embed=embed, view=self)
+            try:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(embed=embed, view=self)
+                else:
+                    await interaction.response.edit_message(embed=embed, view=self)
+            except discord.errors.NotFound:
+                # Interaction expired, try to send a follow-up message instead
+                try:
+                    await interaction.followup.send(embed=embed, view=self)
+                except:
+                    # If all else fails, we can't update the message
+                    pass
 
     # Create initial embed
     embed = discord.Embed(title="🃏 Blackjack - Your Turn", color=0x0099ff)
@@ -1451,18 +1598,18 @@ async def leaderboard(interaction: discord.Interaction, category: str):
         return
 
     current_balances = load_balances()
-    
+
     if not current_balances:
         await interaction.response.send_message("❌ No user data found!", ephemeral=True)
         return
 
     leaderboard_data = []
-    
+
     for user_id, data in current_balances.items():
         try:
             user = bot.get_user(int(user_id))
             display_name = user.display_name if user else f"User #{user_id[-4:]}"
-            
+
             if category == "balance":
                 value = data.get("balance", 0.0)
             elif category == "wagered":
@@ -1476,14 +1623,14 @@ async def leaderboard(interaction: discord.Interaction, category: str):
                 total_withdrawn = data.get("withdrawn", 0.0)
                 total_deposited = data.get("deposited", 0.0)
                 value = current_balance + total_withdrawn - total_deposited
-            
+
             leaderboard_data.append((display_name, value))
         except:
             continue
 
     leaderboard_data.sort(key=lambda x: x[1], reverse=True)
     top_10 = leaderboard_data[:10]
-    
+
     if not top_10:
         await interaction.response.send_message("❌ No data available for this category!", ephemeral=True)
         return
@@ -1495,23 +1642,23 @@ async def leaderboard(interaction: discord.Interaction, category: str):
         "withdrawn": {"title": "⬆️ Total Withdrawn Leaderboard", "emoji": "💰", "color": 0xffaa00},
         "profit": {"title": "📈 Profit/Loss Leaderboard", "emoji": "📊", "color": 0xffd700}
     }
-    
+
     info = category_info[category]
     embed = discord.Embed(title=info["title"], color=info["color"])
-    
+
     leaderboard_text = ""
     for i, (name, value) in enumerate(top_10, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        
+
         if category == "profit":
             profit_emoji = "📈" if value >= 0 else "📉"
             leaderboard_text += f"{medal} **{name}** {profit_emoji} ${value:.2f}\n"
         else:
             leaderboard_text += f"{medal} **{name}** {info['emoji']} ${value:.2f}\n"
-    
+
     embed.add_field(name=f"🏆 Top {len(top_10)} Players", value=leaderboard_text, inline=False)
     embed.set_footer(text=f"Category: {category.title()} | Updated in real-time")
-    
+
     await interaction.response.send_message(embed=embed)
 
 # DEPOSIT COMMAND
@@ -1525,61 +1672,85 @@ async def deposit(interaction: discord.Interaction):
         await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
         return
 
-    if not ltc_handler:
-        await interaction.response.send_message("❌ Crypto deposits are currently unavailable. Please contact an admin.", ephemeral=True)
-        return
-
     # Respond immediately to prevent timeout
     await interaction.response.defer(ephemeral=True)
 
     try:
+        # Check if crypto handler is available
+        if not ltc_handler:
+            print("❌ ltc_handler is None")
+            print(f"   BLOCKCYPHER_API_KEY: {'✅ Set' if BLOCKCYPHER_API_KEY else '❌ Missing'}")
+            print(f"   WEBHOOK_SECRET: {'✅ Set' if WEBHOOK_SECRET else '❌ Missing'}")
+            
+            if not BLOCKCYPHER_API_KEY:
+                await interaction.followup.send("❌ Crypto deposits are unavailable: BlockCypher API key not configured. Please contact an admin.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Crypto deposits are unavailable: Handler initialization failed. Please contact an admin.", ephemeral=True)
+            return
+
+        # Check if the handler has required attributes
+        if not hasattr(ltc_handler, 'generate_deposit_address'):
+            print("❌ ltc_handler missing generate_deposit_address method")
+            await interaction.followup.send("❌ Crypto deposits are unavailable: Handler missing required methods. Please contact an admin.", ephemeral=True)
+            return
+        
+        # Check if API key is properly set in handler
+        if not ltc_handler.api_key:
+            print("❌ ltc_handler has no API key")
+            await interaction.followup.send("❌ Crypto deposits are unavailable: API key not properly loaded. Please contact an admin.", ephemeral=True)
+            return
+
         init_user(user_id)
+
+        print(f"Generating deposit address for user {user_id}...")
         
         # Generate deposit address
         address = await ltc_handler.generate_deposit_address(user_id)
         
+        print(f"Address generation result: {address}")
+
         if address:
             # Get current LTC price
             ltc_rate = await get_ltc_price()
-            
+
             embed = discord.Embed(
                 title="🪙 Litecoin deposit",
                 description="To top up your balance, transfer the desired amount to this address.",
                 color=0xffa500
             )
-            
+
             embed.add_field(
                 name="Please note:",
                 value="1. This is your permanent deposit address.\n2. You can use it as many times as you want.",
                 inline=False
             )
-            
+
             embed.add_field(
                 name="Litecoin Address:",
                 value=f"`{address}`",
                 inline=False
             )
-            
+
             embed.add_field(
                 name="⚠️ Important Security Notice",
                 value="• Send **ONLY** Litecoin (LTC) to this address\n• Other cryptocurrencies will be lost permanently\n• Double-check the address before sending",
                 inline=False
             )
-            
+
             embed.add_field(
                 name="⏰ Processing Information",
                 value="• Deposits are automatically credited after 1 blockchain confirmation\n• Typical confirmation time: ~2.5 minutes\n• You will receive a notification when processed",
                 inline=False
             )
-            
+
             embed.add_field(
                 name="💱 Exchange Rate",
                 value=f"Current LTC Rate: ${ltc_rate:.2f} USD\nDeposits are converted to USD at current market rates",
                 inline=False
             )
-            
+
             embed.set_footer(text="⚡ All deposits are processed automatically • Keep this address safe")
-            
+
             try:
                 # Try to send DM first
                 await interaction.user.send(embed=embed)
@@ -1587,11 +1758,13 @@ async def deposit(interaction: discord.Interaction):
             except discord.Forbidden:
                 await interaction.followup.send(embed=embed, ephemeral=True)
         else:
-            await interaction.followup.send("❌ Failed to generate deposit address. Please try again later.", ephemeral=True)
+            await interaction.followup.send("❌ Failed to generate deposit address. This may be due to:\n• API rate limits\n• Invalid API key\n• Network issues\n\nPlease try again in a few minutes or contact an admin.", ephemeral=True)
     except Exception as e:
         print(f"Error in deposit command: {e}")
+        import traceback
+        traceback.print_exc()
         try:
-            await interaction.followup.send("❌ An error occurred while generating your deposit address. Please try again later.", ephemeral=True)
+            await interaction.followup.send(f"❌ An error occurred while generating your deposit address:\n`{str(e)}`\n\nPlease contact an admin.", ephemeral=True)
         except:
             pass  # If followup also fails, ignore to prevent further errors
 
@@ -1631,7 +1804,7 @@ async def withdraw(interaction: discord.Interaction, amount_usd: float, ltc_addr
 
         # Attempt withdrawal from house wallet
         tx_hash = await ltc_handler.withdraw_from_house_wallet(ltc_address, ltc_amount)
-        
+
         if tx_hash:
             # Successful withdrawal
             balances[user_id]["balance"] -= amount_usd
@@ -1713,13 +1886,13 @@ async def housewithdraw(interaction: discord.Interaction, amount_ltc: float, per
 
     try:
         house_balance = await ltc_handler.get_house_balance()
-        
+
         if house_balance < amount_ltc:
             await interaction.followup.send(f"❌ Insufficient house balance! Available: {house_balance:.6f} LTC, Requested: {amount_ltc:.6f} LTC", ephemeral=True)
             return
 
         tx_hash = await ltc_handler.withdraw_from_house_wallet(personal_address, amount_ltc)
-        
+
         if tx_hash:
             ltc_price = await get_ltc_price()
             amount_usd = amount_ltc * ltc_price
@@ -1768,6 +1941,77 @@ async def housedeposit(interaction: discord.Interaction):
 async def test(interaction: discord.Interaction):
     await interaction.response.send_message("Bot is working! ✅")
 
+# AFFILIATE
+@bot.tree.command(name="affiliate", description="Affiliate yourself to another player to give them 0.5% of your wagers")
+async def affiliate(interaction: discord.Interaction, member: discord.Member):
+    user_id = str(interaction.user.id)
+    affiliate_id = str(member.id)
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(user_id)
+    if not can_proceed:
+        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    # Security checks
+    if user_id == affiliate_id:
+        await interaction.response.send_message("❌ You cannot affiliate yourself to yourself!", ephemeral=True)
+        return
+
+    if member.bot:
+        await interaction.response.send_message("❌ You cannot affiliate yourself to bots!", ephemeral=True)
+        return
+
+    init_user(user_id)
+    init_user(affiliate_id)
+
+    # Check if already affiliated
+    current_affiliate = affiliation_data[user_id]["affiliated_to"]
+    if current_affiliate == affiliate_id:
+        await interaction.response.send_message(f"❌ You are already affiliated to {member.display_name}!", ephemeral=True)
+        return
+
+    # Update affiliation
+    previous_affiliate = None
+    if current_affiliate:
+        try:
+            previous_affiliate = bot.get_user(int(current_affiliate))
+        except:
+            pass
+
+    affiliation_data[user_id]["affiliated_to"] = affiliate_id
+    save_affiliation_data(affiliation_data)
+
+    embed = discord.Embed(
+        title="🤝 Affiliation Updated Successfully! 🎉",
+        color=0x00ff00
+    )
+    
+    if previous_affiliate:
+        embed.add_field(name="👤 Previous Affiliate", value=previous_affiliate.display_name, inline=True)
+    
+    embed.add_field(name="👤 New Affiliate", value=member.display_name, inline=True)
+    embed.add_field(name="💰 Commission Rate", value="0.5%", inline=True)
+    embed.add_field(name="ℹ️ How it works", value=f"{member.display_name} will receive 0.5% of all your future wagers as commission", inline=False)
+    embed.add_field(name="📊 Your Total Earned", value=f"${affiliation_data[affiliate_id]['total_earned']:.2f} USD", inline=True)
+    embed.set_footer(text="Start gambling to generate commission for your affiliate!")
+
+    await interaction.response.send_message(embed=embed)
+
+    # Notify the affiliate
+    try:
+        affiliate_embed = discord.Embed(
+            title="🎉 New Affiliate! 🤝",
+            description=f"{interaction.user.display_name} has affiliated themselves to you!",
+            color=0x00ff00
+        )
+        affiliate_embed.add_field(name="💰 You will earn", value="0.5% of their wagers", inline=True)
+        affiliate_embed.add_field(name="📊 Your Total Earned", value=f"${affiliation_data[affiliate_id]['total_earned']:.2f} USD", inline=True)
+        
+        await member.send(embed=affiliate_embed)
+    except discord.Forbidden:
+        pass  # User has DMs disabled
+
 # HELP
 @bot.tree.command(name="help", description="View all available game modes and commands")
 async def help_command(interaction: discord.Interaction):
@@ -1786,7 +2030,7 @@ async def help_command(interaction: discord.Interaction):
     # Game Commands Section
     games_text = """
 🪙 `/coinflip [heads/tails] [amount]` - Call heads or tails (80% RTP)
-🎲 `/dice [amount]` - Roll dice, win if >3 (75% RTP)
+🎲 `/dice [amount] [over/under]` - Roll dice, choose over/under 3 (75% RTP)
 🤜 `/rps [choice] [amount]` - Rock Paper Scissors (78% RTP)
 🎰 `/slots [amount]` - Spin the reels for jackpots!
 🃏 `/blackjack [amount]` - Beat the dealer with strategy!
@@ -1801,6 +2045,7 @@ async def help_command(interaction: discord.Interaction):
 💰 `/balance` - Check your account stats and balance
 💸 `/tip [user] [amount]` - Send money to another player
 🎁 `/claimrakeback` - Claim 0.5% of your total wagered
+🤝 `/affiliate [user]` - Affiliate to a player (they get 0.5% of your wagers)
 💎 `/deposit` - Generate a Litecoin deposit address
 📤 `/withdraw [amount] [address]` - Withdraw to crypto address
 🏆 `/leaderboard [category]` - View top players
