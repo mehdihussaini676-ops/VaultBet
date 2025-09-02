@@ -167,22 +167,24 @@ def litecoin_webhook():
                         except Exception as e:
                             print(f"Error notifying user of confirmed transaction: {e}")
 
-                        # Forward funds to house wallet after a short delay
-                        await asyncio.sleep(15)  # Wait 15 seconds for confirmation to settle
-
-                        # Get deposit address private key for forwarding
+                        # Schedule forwarding to house wallet (don't block webhook)
                         try:
-                            with open("crypto_addresses.json", "r") as f:
-                                mappings = json.load(f)
-                                if address in mappings:
+                            from crypto_handler import ltc_handler
+                            if ltc_handler:
+                                # Run forwarding in background without blocking webhook
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
                                     private_key = mappings[address]["private_key"]
-
-                                    # Forward to house wallet
-                                    forward_tx = await ltc_handler.forward_to_house_wallet(address, private_key, amount_ltc)
+                                    forward_tx = loop.run_until_complete(
+                                        ltc_handler.forward_to_house_wallet(address, private_key, amount_ltc)
+                                    )
                                     if forward_tx:
                                         print(f"✅ Successfully forwarded {amount_ltc:.6f} LTC to house wallet: {forward_tx}")
                                     else:
                                         print(f"❌ Failed to forward deposit to house wallet")
+                                finally:
+                                    loop.close()
                         except Exception as e:
                             print(f"❌ Error forwarding to house wallet: {e}")
 
