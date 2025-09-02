@@ -4,6 +4,7 @@ import json
 import hashlib
 import hmac
 import discord
+import os
 from typing import Optional, Dict, Any, List
 
 class LitecoinHandler:
@@ -20,6 +21,19 @@ class LitecoinHandler:
     async def generate_deposit_address(self, user_id: str) -> Optional[str]:
         """Generate a new deposit address for a user"""
         try:
+            # Check if user already has an address
+            try:
+                with open("crypto_addresses.json", "r") as f:
+                    mappings = json.load(f)
+                
+                # Find existing address for this user
+                for address, data in mappings.items():
+                    if data.get("user_id") == user_id:
+                        print(f"Returning existing address for user {user_id}: {address}")
+                        return address
+            except FileNotFoundError:
+                pass
+
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/addrs"
                 params = {"token": self.api_key}
@@ -36,9 +50,11 @@ class LitecoinHandler:
                         # Set up webhook
                         await self.setup_webhook(address)
 
+                        print(f"Generated new address for user {user_id}: {address}")
                         return address
                     else:
-                        print(f"Failed to generate address: {response.status}")
+                        error_text = await response.text()
+                        print(f"Failed to generate address: HTTP {response.status} - {error_text}")
                         return None
         except Exception as e:
             print(f"Error generating address: {e}")
@@ -401,19 +417,44 @@ class LitecoinHandler:
 
     async def check_pending_transactions(self):
         """Check status of pending transactions"""
-        for tx_hash, tx_info in list(self.pending_transactions.items()):
+        try:
+            # Load pending transactions from file
             try:
-                tx_details = await self.get_transaction_details(tx_hash)
-                if tx_details:
-                    confirmations = tx_details.get('confirmations', 0)
+                with open('pending_transactions.json', 'r') as f:
+                    pending_file = json.load(f)
+            except FileNotFoundError:
+                pending_file = {}
 
-                    if confirmations >= 1 and not tx_info.get('confirmed'):
-                        # Transaction confirmed
-                        await self.handle_confirmed_transaction(tx_hash, tx_details, tx_info)
-                        self.pending_transactions[tx_hash]['confirmed'] = True
+            # Merge file transactions with memory transactions
+            for tx_hash, tx_info in pending_file.items():
+                if tx_hash not in self.pending_transactions:
+                    self.pending_transactions[tx_hash] = tx_info
 
-            except Exception as e:
-                print(f"Error checking transaction {tx_hash}: {e}")
+            for tx_hash, tx_info in list(self.pending_transactions.items()):
+                try:
+                    if tx_info.get('confirmed'):
+                        continue
+
+                    tx_details = await self.get_transaction_details(tx_hash)
+                    if tx_details:
+                        confirmations = tx_details.get('confirmations', 0)
+                        print(f"Checking transaction {tx_hash[:8]}... - {confirmations} confirmations")
+
+                        if confirmations >= 1 and not tx_info.get('confirmed'):
+                            # Transaction confirmed
+                            print(f"Transaction {tx_hash[:8]}... confirmed! Processing...")
+                            await self.handle_confirmed_transaction(tx_hash, tx_details, tx_info)
+                            self.pending_transactions[tx_hash]['confirmed'] = True
+
+                            # Update file
+                            pending_file[tx_hash] = self.pending_transactions[tx_hash]
+                            with open('pending_transactions.json', 'w') as f:
+                                json.dump(pending_file, f, indent=2)
+
+                except Exception as e:
+                    print(f"Error checking transaction {tx_hash}: {e}")
+        except Exception as e:
+            print(f"Error in check_pending_transactions: {e}")
 
     async def handle_unconfirmed_transaction(self, tx_data: Dict, user_id: str, address: str, amount_ltc: float):
         """Handle when an unconfirmed transaction is detected"""
@@ -458,39 +499,70 @@ class LitecoinHandler:
         """Handle when a transaction gets confirmed and forward to house wallet"""
         try:
             if not self.bot:
+                print("No bot instance available for notifications")
                 return
 
             user_id = tx_info['user_id']
-            amount_ltc = tx_info['amount_ltc']
-            deposit_address = tx_info['address']
+            amount_ltc = tx_info.get('amount_ltc', 0)
+            deposit_address = tx_info.get('address', '')
+
+            print(f"Processing confirmed transaction for user {user_id}: {amount_ltc} LTC")
 
             user = self.bot.get_user(int(user_id))
             if not user:
+                print(f"Could not find user {user_id}")
                 return
 
             # Get current LTC price for USD conversion
             ltc_price = await self.get_ltc_to_usd_rate()
             amount_usd = amount_ltc * ltc_price
 
-            # Forward funds to house wallet after a short delay
-            await asyncio.sleep(10)  # Wait 10 seconds for confirmation to settle
+            print(f"Converting {amount_ltc} LTC to ${amount_usd:.2f} USD at rate ${ltc_price:.2f}")
 
-            # Get deposit address private key for forwarding
+            # Update user balance in the main balance file
             try:
-                with open("crypto_addresses.json", "r") as f:
-                    mappings = json.load(f)
-                    if deposit_address in mappings:
-                        private_key = mappings[deposit_address]["private_key"]
+                # Load balances
+                if os.path.exists("balances.json"):
+                    with open("balances.json", "r") as f:
+                        balances = json.load(f)
+                else:
+                    balances = {}
 
-                        # Forward to house wallet
-                        forward_tx = await self.forward_to_house_wallet(deposit_address, private_key, amount_ltc)
-                        if forward_tx:
-                            print(f"Successfully forwarded deposit to house wallet: {forward_tx}")
-                        else:
-                            print(f"Failed to forward deposit to house wallet")
+                # Initialize user if not exists
+                if user_id not in balances:
+                    balances[user_id] = {"balance": 0.0, "deposited": 0.0, "withdrawn": 0.0, "wagered": 0.0}
+
+                # Add to balance and deposited
+                balances[user_id]["balance"] += amount_usd
+                balances[user_id]["deposited"] += amount_usd
+
+                # Save balances
+                with open("balances.json", "w") as f:
+                    json.dump(balances, f)
+
+                print(f"Updated user {user_id} balance: +${amount_usd:.2f} USD")
+
+            except Exception as e:
+                print(f"Error updating balance: {e}")
+
+            # Forward funds to house wallet
+            try:
+                if deposit_address and os.path.exists("crypto_addresses.json"):
+                    with open("crypto_addresses.json", "r") as f:
+                        mappings = json.load(f)
+                        if deposit_address in mappings:
+                            private_key = mappings[deposit_address]["private_key"]
+
+                            # Forward to house wallet
+                            forward_tx = await self.forward_to_house_wallet(deposit_address, private_key, amount_ltc)
+                            if forward_tx:
+                                print(f"Successfully forwarded deposit to house wallet: {forward_tx}")
+                            else:
+                                print(f"Failed to forward deposit to house wallet")
             except Exception as e:
                 print(f"Error forwarding to house wallet: {e}")
 
+            # Send notification to user
             embed = discord.Embed(
                 title="✅ Deposit confirmed and credited!",
                 description="Your deposit has been successfully processed",
@@ -507,6 +579,8 @@ class LitecoinHandler:
                 print(f"Sent confirmation notification to user {user_id}")
             except discord.Forbidden:
                 print(f"Could not send DM to user {user_id}")
+            except Exception as e:
+                print(f"Error sending notification: {e}")
 
         except Exception as e:
             print(f"Error handling confirmed transaction: {e}")
