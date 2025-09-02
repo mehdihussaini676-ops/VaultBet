@@ -25,7 +25,7 @@ class LitecoinHandler:
             try:
                 with open("crypto_addresses.json", "r") as f:
                     mappings = json.load(f)
-                
+
                 # Find existing address for this user
                 for address, data in mappings.items():
                     if data.get("user_id") == user_id:
