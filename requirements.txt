@@ -3,3 +3,8 @@ python-dotenv
 aiohttp
 flask
 pycryptodome
+discord.py
+aiohttp
+python-dotenv
+flask
+requests
