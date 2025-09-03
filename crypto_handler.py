@@ -210,7 +210,7 @@ class LitecoinHandler:
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
-                        
+
                         # Add private key for signing
                         tx_skeleton["privkeys"] = [private_key]
 
@@ -272,7 +272,7 @@ class LitecoinHandler:
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
-                        
+
                         # Add private key for signing
                         tx_skeleton["privkeys"] = [self.house_wallet_private_key]
 
