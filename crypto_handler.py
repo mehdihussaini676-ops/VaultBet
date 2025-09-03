@@ -182,10 +182,16 @@ class LitecoinHandler:
             return None
 
         try:
-            # Calculate fee and amount to send
-            fee_satoshis = 1000  # ~0.00001 LTC
-            amount_satoshis = int(amount_ltc * 100000000)
-            amount_to_send = amount_satoshis - fee_satoshis
+            # Get current balance of the from_address
+            current_balance = await self.get_address_balance(from_address)
+            if current_balance < 0.0001:  # Need minimum balance to forward
+                print(f"Insufficient balance to forward: {current_balance:.8f} LTC")
+                return None
+
+            # Calculate fee and amount to send (use most of the balance)
+            fee_satoshis = 2000  # ~0.00002 LTC (higher fee for reliable forwarding)
+            total_satoshis = int(current_balance * 100000000)
+            amount_to_send = total_satoshis - fee_satoshis
 
             if amount_to_send <= 0:
                 print("Amount too small to forward after fees")
@@ -204,40 +210,53 @@ class LitecoinHandler:
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
+                        
+                        # Add private key for signing
+                        tx_skeleton["privkeys"] = [private_key]
 
-                        # Sign and send transaction (simplified for demo)
+                        # Send signed transaction
                         send_url = f"{self.base_url}/txs/send"
                         async with session.post(send_url, json=tx_skeleton, params=params) as send_response:
                             if send_response.status == 201:
                                 result = await send_response.json()
-                                print(f"Forwarded {amount_ltc:.6f} LTC to house wallet: {result['tx']['hash']}")
+                                forwarded_ltc = amount_to_send / 100000000
+                                print(f"✅ Forwarded {forwarded_ltc:.8f} LTC to house wallet: {result['tx']['hash']}")
                                 return result["tx"]["hash"]
+                            else:
+                                error_text = await send_response.text()
+                                print(f"❌ Failed to send transaction: {send_response.status} - {error_text}")
+                                return None
+                    else:
+                        error_text = await response.text()
+                        print(f"❌ Failed to create transaction: {response.status} - {error_text}")
+                        return None
 
-                return None
         except Exception as e:
-            print(f"Error forwarding to house wallet: {e}")
+            print(f"❌ Error forwarding to house wallet: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     async def withdraw_from_house_wallet(self, to_address: str, amount_ltc: float) -> Optional[str]:
         """Withdraw funds from house wallet to specified address"""
         if not self.house_wallet_address or not self.house_wallet_private_key:
-            print("House wallet not initialized")
+            print("❌ House wallet not initialized")
             return None
 
         try:
             # Check house balance
             house_balance = await self.get_house_balance()
             if house_balance < amount_ltc:
-                print(f"Insufficient house balance: {house_balance:.6f} LTC < {amount_ltc:.6f} LTC")
+                print(f"❌ Insufficient house balance: {house_balance:.8f} LTC < {amount_ltc:.8f} LTC")
                 return None
 
             # Calculate fee and amount to send
-            fee_satoshis = 1000  # ~0.00001 LTC
+            fee_satoshis = 2000  # ~0.00002 LTC
             amount_satoshis = int(amount_ltc * 100000000)
             amount_to_send = amount_satoshis - fee_satoshis
 
             if amount_to_send <= 0:
-                print("Amount too small after fees")
+                print("❌ Amount too small after fees")
                 return None
 
             async with aiohttp.ClientSession() as session:
@@ -253,18 +272,31 @@ class LitecoinHandler:
                 async with session.post(url, json=tx_data, params=params) as response:
                     if response.status == 201:
                         tx_skeleton = await response.json()
+                        
+                        # Add private key for signing
+                        tx_skeleton["privkeys"] = [self.house_wallet_private_key]
 
-                        # Sign and send transaction (simplified for demo)
+                        # Send signed transaction
                         send_url = f"{self.base_url}/txs/send"
                         async with session.post(send_url, json=tx_skeleton, params=params) as send_response:
                             if send_response.status == 201:
                                 result = await send_response.json()
-                                print(f"Withdrew {amount_ltc:.6f} LTC from house wallet: {result['tx']['hash']}")
+                                actual_amount = amount_to_send / 100000000
+                                print(f"✅ Withdrew {actual_amount:.8f} LTC from house wallet: {result['tx']['hash']}")
                                 return result["tx"]["hash"]
+                            else:
+                                error_text = await send_response.text()
+                                print(f"❌ Failed to send withdrawal transaction: {send_response.status} - {error_text}")
+                                return None
+                    else:
+                        error_text = await response.text()
+                        print(f"❌ Failed to create withdrawal transaction: {response.status} - {error_text}")
+                        return None
 
-                return None
         except Exception as e:
-            print(f"Error withdrawing from house wallet: {e}")
+            print(f"❌ Error withdrawing from house wallet: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def verify_webhook(self, payload: bytes, signature: str) -> bool:
@@ -546,8 +578,9 @@ class LitecoinHandler:
                 print(f"Error updating balance: {e}")
 
             # Forward funds to house wallet
+            forwarding_success = False
             try:
-                if deposit_address and os.path.exists("crypto_addresses.json"):
+                if deposit_address and os.path.exists("crypto_addresses.json") and self.house_wallet_address:
                     with open("crypto_addresses.json", "r") as f:
                         mappings = json.load(f)
                         if deposit_address in mappings:
@@ -556,11 +589,23 @@ class LitecoinHandler:
                             # Forward to house wallet
                             forward_tx = await self.forward_to_house_wallet(deposit_address, private_key, amount_ltc)
                             if forward_tx:
-                                print(f"Successfully forwarded deposit to house wallet: {forward_tx}")
+                                print(f"✅ Successfully forwarded deposit to house wallet: {forward_tx}")
+                                forwarding_success = True
                             else:
-                                print(f"Failed to forward deposit to house wallet")
+                                print(f"❌ Failed to forward deposit to house wallet")
+                        else:
+                            print(f"❌ Address {deposit_address} not found in mappings")
+                else:
+                    if not self.house_wallet_address:
+                        print(f"❌ House wallet not initialized for forwarding")
+                    elif not deposit_address:
+                        print(f"❌ No deposit address provided for forwarding")
+                    else:
+                        print(f"❌ crypto_addresses.json not found")
             except Exception as e:
-                print(f"Error forwarding to house wallet: {e}")
+                print(f"❌ Error forwarding to house wallet: {e}")
+
+            print(f"🔄 Forwarding result for {deposit_address}: {'✅ Success' if forwarding_success else '❌ Failed'}")
 
             # Send notification to user
             embed = discord.Embed(
