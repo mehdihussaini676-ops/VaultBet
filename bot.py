@@ -7,6 +7,11 @@ import json
 import aiohttp
 import asyncio    
 import time
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 # Load environment variables directly from os.environ (works with Replit Secrets)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_ID", "").split(",") if id.strip()]
@@ -187,12 +192,21 @@ async def get_ltc_price():
         return 75.0  # Fallback price
 
 async def check_notifications():
-    """Check for notifications from the webhook server"""
-    print("🔔 Notification checker started - checking every 2 seconds")
+    """Check for notifications from the webhook server and automatically process deposits"""
+    print("🔔 Notification checker started - checking every 5 seconds")
 
     while True:
         try:
-            # Debug: Check if notification file exists and log its status
+            # First, run automatic force check every 30 seconds
+            current_time = time.time()
+            if not hasattr(check_notifications, 'last_force_check'):
+                check_notifications.last_force_check = 0
+
+            if current_time - check_notifications.last_force_check >= 30:
+                check_notifications.last_force_check = current_time
+                await auto_force_check_deposits()
+
+            # Check for notifications from webhook
             notification_file_exists = os.path.exists('notifications.json')
 
             if notification_file_exists:
@@ -202,24 +216,16 @@ async def check_notifications():
 
                     if content:
                         notifications = json.loads(content)
-                        if notifications:
-                            print(f"🔔 Found {len(notifications)} notification(s) to process")
-                        else:
-                            print(f"🔔 Notification file exists but is empty array")
                     else:
                         notifications = []
-                        print(f"🔔 Notification file exists but is empty")
 
                 except (json.JSONDecodeError, FileNotFoundError) as e:
-                    print(f"🔔 Error reading notifications file: {e}")
                     notifications = []
 
                 if notifications:
                     processed_notifications = []
-                    for i, notification in enumerate(notifications):
+                    for notification in notifications:
                         try:
-                            print(f"🔔 Processing notification {i+1}: {notification.get('type')}")
-
                             if notification.get('type') == 'deposit_confirmed':
                                 user_id = notification['user_id']
                                 amount_ltc = notification['amount_ltc']
@@ -241,22 +247,21 @@ async def check_notifications():
                                     embed.add_field(name="🎮 Status", value="Balance updated - ready to play!", inline=True)
                                     embed.set_footer(text="Your deposit has been automatically credited")
 
-                                    await user.send(embed=embed)
-                                    print(f"✅ Sent deposit confirmation to user {user_id}")
+                                    try:
+                                        await user.send(embed=embed)
+                                        print(f"✅ Sent deposit confirmation to user {user_id}")
+                                        # Log the deposit
+                                        await log_deposit(user, amount_usd)
+                                    except discord.Forbidden:
+                                        print(f"⚠️ Could not send DM to user {user_id} - DMs disabled")
+                                    except Exception as dm_error:
+                                        print(f"❌ Error sending DM to user {user_id}: {dm_error}")
 
-                                    # Log the deposit
-                                    await log_deposit(user, amount_usd)
+                                processed_notifications.append(notification)
 
-                                    processed_notifications.append(notification)
-                                else:
-                                    print(f"❌ Could not find user {user_id}")
-                                    processed_notifications.append(notification)  # Still mark as processed
                         except Exception as e:
                             print(f"❌ Error processing notification: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            # Still mark as processed to avoid infinite loops
-                            processed_notifications.append(notification)
+                            processed_notifications.append(notification)  # Still mark as processed
 
                     # Clear processed notifications
                     if processed_notifications:
@@ -264,42 +269,158 @@ async def check_notifications():
                             remaining_notifications = [n for n in notifications if n not in processed_notifications]
                             with open('notifications.json', 'w') as f:
                                 json.dump(remaining_notifications, f, indent=2)
-                            print(f"✅ Cleared {len(processed_notifications)} processed notifications, {len(remaining_notifications)} remaining")
+                            if processed_notifications:
+                                print(f"✅ Processed {len(processed_notifications)} notification(s)")
                         except Exception as e:
                             print(f"❌ Error clearing notifications: {e}")
-            else:
-                # File doesn't exist - this is normal when there are no notifications
-                pass
-
-            # Also check if there are any pending transactions that might have been confirmed
-            try:
-                if os.path.exists('pending_transactions.json'):
-                    with open('pending_transactions.json', 'r') as f:
-                        pending = json.load(f)
-
-                    confirmed_count = 0
-                    for tx_hash, tx_info in pending.items():
-                        if tx_info.get('confirmed'):
-                            confirmed_count += 1
-                            if not tx_info.get('notification_sent'):
-                                # Mark as notification sent to avoid duplicates
-                                tx_info['notification_sent'] = True
-                                print(f"✅ Marked transaction {tx_hash[:8]} as notification sent")
-
-                    if confirmed_count > 0:
-                        with open('pending_transactions.json', 'w') as f:
-                            json.dump(pending, f, indent=2)
-                        print(f"🔔 Found {confirmed_count} confirmed transactions in pending file")
-
-            except Exception as e:
-                print(f"❌ Error checking pending transactions: {e}")
 
         except Exception as e:
-            print(f"❌ Error in notification checker: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Error processing notifications file: {e}")
 
-        await asyncio.sleep(2)  # Check every 2 seconds for faster response
+        await asyncio.sleep(5)  # Check every 5 seconds
+
+async def auto_force_check_deposits():
+    """Automatically check all addresses for confirmed transactions every 30 seconds"""
+    try:
+        if not ltc_handler:
+            print("⚠️ auto_force_check_deposits: LTC handler not initialized.")
+            return
+
+        # Load all addresses
+        try:
+            with open('crypto_addresses.json', 'r') as f:
+                address_mappings = json.load(f)
+        except FileNotFoundError:
+            print("⚠️ auto_force_check_deposits: crypto_addresses.json not found.")
+            return
+
+        processed_count = 0
+
+        for address, addr_data in address_mappings.items():
+            user_id = addr_data['user_id']
+
+            try:
+                # Get all transactions for this address
+                async with aiohttp.ClientSession() as session:
+                    url = f"{ltc_handler.base_url}/addrs/{address}/full"
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            addr_full_data = await response.json()
+                            transactions = addr_full_data.get('txs', [])
+
+                            # Load existing processed transactions
+                            try:
+                                with open('pending_transactions.json', 'r') as f:
+                                    pending = json.load(f)
+                            except FileNotFoundError:
+                                pending = {}
+
+                            for tx in transactions:
+                                tx_hash = tx['hash']
+                                confirmations = tx.get('confirmations', 0)
+
+                                # Skip if already processed
+                                if tx_hash in pending and pending[tx_hash].get('confirmed') and pending[tx_hash].get('notification_sent'):
+                                    continue
+
+                                # Only process confirmed transactions
+                                if confirmations >= 1:
+                                    # Check if this is an incoming transaction
+                                    incoming_amount = 0
+                                    for output in tx.get('outputs', []):
+                                        if address in output.get('addresses', []):
+                                            incoming_amount += output.get('value', 0) / 100000000
+
+                                    if incoming_amount > 0:
+                                        # Convert to USD
+                                        ltc_price = await get_ltc_price()
+                                        amount_usd = incoming_amount * ltc_price
+
+                                        # Update balance
+                                        balances = load_balances()
+                                        if user_id not in balances:
+                                            balances[user_id] = {"balance": 0.0, "deposited": 0.0, "withdrawn": 0.0, "wagered": 0.0}
+
+                                        old_balance = balances[user_id]["balance"]
+                                        balances[user_id]["balance"] += amount_usd
+                                        balances[user_id]["deposited"] += amount_usd
+                                        save_balances(balances)
+
+                                        print(f"🔄 AUTO: Processed {incoming_amount:.8f} LTC (${amount_usd:.2f}) for user {user_id}")
+
+                                        # Send notification
+                                        user = bot.get_user(int(user_id))
+                                        if user:
+                                            embed = discord.Embed(
+                                                title="✅ Deposit Confirmed & Credited!",
+                                                description="Your Litecoin deposit has been automatically processed",
+                                                color=0x00ff00
+                                            )
+                                            embed.add_field(name="💰 Amount", value=f"{incoming_amount:.8f} LTC", inline=True)
+                                            embed.add_field(name="💵 USD Value", value=f"${amount_usd:.2f} USD", inline=True)
+                                            embed.add_field(name="🔗 Transaction", value=f"`{tx_hash[:16]}...`", inline=False)
+                                            embed.add_field(name="✅ Confirmations", value=f"{confirmations}", inline=True)
+                                            embed.add_field(name="🎮 Status", value="Balance updated - ready to play!", inline=True)
+                                            embed.set_footer(text="Your deposit has been credited automatically!")
+
+                                            try:
+                                                await user.send(embed=embed)
+                                                await log_deposit(user, amount_usd)
+                                                print(f"✅ AUTO: Sent notification to user {user_id}")
+                                            except discord.Forbidden:
+                                                print(f"⚠️ Could not send DM to user {user_id} - DMs disabled")
+                                            except Exception as dm_error:
+                                                print(f"❌ Error sending DM: {dm_error}")
+
+                                        # Forward funds to house wallet
+                                        forwarding_success = False
+                                        try:
+                                            if ltc_handler and ltc_handler.house_wallet_address:
+                                                private_key = addr_data.get('private_key')
+                                                if private_key:
+                                                    forward_tx = await ltc_handler.forward_to_house_wallet(address, private_key, incoming_amount)
+                                                    if forward_tx:
+                                                        print(f"✅ AUTO: Forwarded {incoming_amount:.8f} LTC to house wallet: {forward_tx}")
+                                                        forwarding_success = True
+                                                    else:
+                                                        print(f"⚠️ AUTO: Failed to forward to house wallet")
+                                                else:
+                                                    print(f"⚠️ AUTO: No private key found for address {address}")
+                                            else:
+                                                print(f"⚠️ AUTO: House wallet not available for forwarding")
+                                        except Exception as forward_error:
+                                            print(f"❌ AUTO: Error forwarding to house wallet: {forward_error}")
+
+                                        # Record as processed
+                                        pending[tx_hash] = {
+                                            'user_id': user_id,
+                                            'address': address,
+                                            'amount_ltc': incoming_amount,
+                                            'confirmed': True,
+                                            'notification_sent': True,
+                                            'notification_processed': True,
+                                            'processed_by': 'auto_check',
+                                            'confirmations': confirmations,
+                                            'timestamp': time.time(),
+                                            'forwarded_to_house': forwarding_success
+                                        }
+
+                                        processed_count += 1
+
+                            # Save updated pending transactions
+                            if processed_count > 0:
+                                with open('pending_transactions.json', 'w') as f:
+                                    json.dump(pending, f, indent=2)
+
+            except Exception as e:
+                print(f"⚠️ auto_force_check_deposits: Error processing address {address}: {e}")
+                continue  # Skip this address and continue with others
+
+        if processed_count > 0:
+            print(f"🔄 AUTO: Processed {processed_count} confirmed transactions")
+
+    except Exception as e:
+        print(f"❌ Error in auto force check: {e}")
 
 @bot.event
 async def on_ready():
@@ -316,11 +437,21 @@ async def on_ready():
 
     # Always start the webhook server and notification checker first
     import threading
-    from webhook_server import start_webhook_server
+    import subprocess
+    import sys
 
-    webhook_thread = threading.Thread(target=start_webhook_server, daemon=True)
-    webhook_thread.start()
-    print("✅ Webhook server started on port 5000")
+    def start_webhook_server():
+        """Start webhook server in a separate process"""
+        try:
+            subprocess.Popen([sys.executable, "webhook_server.py"], 
+                           stdout=subprocess.PIPE, 
+                           stderr=subprocess.PIPE)
+            print("✅ Webhook server started on port 5000")
+        except Exception as e:
+            print(f"❌ Failed to start webhook server: {e}")
+
+    # Start webhook server
+    start_webhook_server()
 
     # Start notification checker
     asyncio.create_task(check_notifications())
@@ -691,8 +822,21 @@ async def coinflip(interaction: discord.Interaction, choice: str, wager_usd: flo
     add_rakeback(user_id, wager_usd)  # Add rakeback
     save_balances(balances)
 
+    # Create visual representation
+    coin_visual = "🪙" if coin_flip == "heads" else "🟡"
+    choice_visual = "🪙" if choice.lower() == "heads" else "🟡"
+
     embed = discord.Embed(title=title, color=color)
-    embed.add_field(name="🎯 Result", value=result_text, inline=False)
+
+    # Visual section
+    visual_text = f"""
+**Your Call:** {choice.title()} {choice_visual}
+**Result:** {coin_flip.title()} {coin_visual}
+
+{coin_visual} ← **The coin landed here!**
+    """
+
+    embed.add_field(name="🎯 Coinflip Visual", value=visual_text, inline=False)
     embed.add_field(name="💰 Wagered", value=f"${wager_usd:.2f} USD", inline=True)
     embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
 
@@ -757,8 +901,22 @@ async def dice(interaction: discord.Interaction, wager_usd: float, choice: str):
     add_rakeback(user_id, wager_usd)
     save_balances(balances)
 
+    # Create dice visual
+    dice_visuals = {
+        1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"
+    }
+
     embed = discord.Embed(title=title, color=color)
-    embed.add_field(name="🎯 Result", value=result_text, inline=False)
+
+    # Visual section
+    visual_text = f"""
+**Your Bet:** {user_choice.title()} (roll {win_condition})
+**Dice Result:** {dice_visuals[roll]} **{roll}**
+
+{dice_visuals[roll]} ← **You rolled this number!**
+    """
+
+    embed.add_field(name="🎲 Dice Visual", value=visual_text, inline=False)
     embed.add_field(name="💰 Wagered", value=f"${wager_usd:.2f} USD", inline=True)
     embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
 
@@ -1254,7 +1412,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
                 elif dealer_value > 21:
                     winnings = hand_wager + (hand_wager * 0.82)
                     total_winnings += winnings
-                    results.append(f"Hand {i+1}: WON ({player_value}) - Dealer bust! +${winnings:.2f}")
+                    results.append(f"Hand {i+1}: WON ({player_value} vs {dealer_value}) - +${winnings:.2f}")
                 elif player_value > dealer_value:
                     winnings = hand_wager + (hand_wager * 0.82)
                     total_winnings += winnings
@@ -1460,6 +1618,7 @@ async def mines(interaction: discord.Interaction, wager_usd: float, mine_count: 
                 embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
                 embed.set_footer(text="Perfect Game Bonus!")
 
+                self.clear_items()
                 await interaction.response.edit_message(embed=embed, view=self)
                 return
 
@@ -1603,7 +1762,7 @@ async def towers(interaction: discord.Interaction, wager_usd: float, difficulty:
                     row=1
                 )
                 cashout_button.callback = self.cashout_callback
-                self.add_item(cashout_button)
+                self.add_item(button)
 
         async def path_callback(self, interaction: discord.Interaction):
             if interaction.user.id != int(self.user_id) or self.game_over:
@@ -1786,126 +1945,21 @@ async def leaderboard(interaction: discord.Interaction, category: str):
 
     await interaction.response.send_message(embed=embed)
 
-# DEPOSIT COMMAND
-@bot.tree.command(name="deposit", description="Generate a Litecoin deposit address")
-async def deposit(interaction: discord.Interaction):
-    global ltc_handler
-    user_id = str(interaction.user.id)
+# Load withdrawal queue
+def load_withdrawal_queue():
+    if not os.path.exists("withdrawal_queue.json"):
+        return {}
+    with open("withdrawal_queue.json", "r") as f:
+        return json.load(f)
 
-    # Check cooldown
-    can_proceed, remaining_time = check_cooldown(user_id)
-    if not can_proceed:
-        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
-        return
+# Save withdrawal queue
+def save_withdrawal_queue(queue):
+    with open("withdrawal_queue.json", "w") as f:
+        json.dump(queue, f, indent=2)
 
-    # Respond immediately to prevent timeout
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        # Check if crypto handler is available
-        if not ltc_handler:
-            print("❌ ltc_handler is None - attempting to reinitialize...")
-            print(f"   BLOCKCYPHER_API_KEY: {'✅ Set' if BLOCKCYPHER_API_KEY else '❌ Missing'}")
-            print(f"   WEBHOOK_SECRET: {'✅ Set' if WEBHOOK_SECRET else '❌ Missing'}")
-
-            # Try to reinitialize the handler
-            if BLOCKCYPHER_API_KEY:
-                try:
-                    from crypto_handler import init_litecoin_handler
-                    ltc_handler = init_litecoin_handler(BLOCKCYPHER_API_KEY, WEBHOOK_SECRET, bot)
-                    print("✅ Successfully reinitialized crypto handler")
-                except Exception as e:
-                    print(f"❌ Failed to reinitialize handler: {e}")
-                    await interaction.followup.send("❌ Crypto deposits are temporarily unavailable. Please try again in a moment or contact an admin.", ephemeral=True)
-                    return
-            else:
-                await interaction.followup.send("❌ Crypto deposits are unavailable: API key not configured. Please contact an admin.", ephemeral=True)
-                return
-
-        # Check if the handler has required attributes
-        if not hasattr(ltc_handler, 'generate_deposit_address'):
-            print("❌ ltc_handler missing generate_deposit_address method")
-            await interaction.followup.send("❌ Crypto deposits are unavailable: Handler missing required methods. Please contact an admin.", ephemeral=True)
-            return
-
-        # Check if API key is properly set in handler
-        if not hasattr(ltc_handler, 'api_key') or not ltc_handler.api_key:
-            print("❌ ltc_handler has no API key")
-            await interaction.followup.send("❌ Crypto deposits are unavailable: API key not properly loaded. Please contact an admin.", ephemeral=True)
-            return
-
-        init_user(user_id)
-
-        print(f"Generating deposit address for user {user_id}...")
-
-        # Generate deposit address
-        address = await ltc_handler.generate_deposit_address(user_id)
-
-        print(f"Address generation result: {address}")
-
-        if address:
-            # Get current LTC price
-            ltc_rate = await get_ltc_price()
-
-            embed = discord.Embed(
-                title="🪙 Litecoin deposit",
-                description="To top up your balance, transfer the desired amount to this address.",
-                color=0xffa500
-            )
-
-            embed.add_field(
-                name="Please note:",
-                value="1. This is your permanent deposit address.\n2. You can use it as many times as you want.",
-                inline=False
-            )
-
-            embed.add_field(
-                name="Litecoin Address:",
-                value=f"`{address}`",
-                inline=False
-            )
-
-            embed.add_field(
-                name="⚠️ Important Security Notice",
-                value="• Send **ONLY** Litecoin (LTC) to this address\n• Other cryptocurrencies will be lost permanently\n• Double-check the address before sending",
-                inline=False
-            )
-
-            embed.add_field(
-                name="⏰ Processing Information",
-                value="• Deposits are automatically credited after 1 blockchain confirmation\n• Typical confirmation time: ~2.5 minutes\n• You will receive a notification when processed",
-                inline=False
-            )
-
-            embed.add_field(
-                name="💱 Exchange Rate",
-                value=f"Current LTC Rate: ${ltc_rate:.2f} USD\nDeposits are converted to USD at current market rates",
-                inline=False
-            )
-
-            embed.set_footer(text="⚡ All deposits are processed automatically • Keep this address safe")
-
-            try:
-                # Try to send DM first
-                await interaction.user.send(embed=embed)
-                await interaction.followup.send("📨 I've sent you a DM with your deposit address and instructions!", ephemeral=True)
-            except discord.Forbidden:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.followup.send("❌ Failed to generate deposit address. This may be due to:\n• API rate limits\n• Invalid API key\n• Network issues\n\nPlease try again in a few minutes or contact an admin.", ephemeral=True)
-    except Exception as e:
-        print(f"Error in deposit command: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            await interaction.followup.send(f"❌ An error occurred while generating your deposit address:\n`{str(e)}`\n\nPlease contact an admin.", ephemeral=True)
-        except:
-            pass  # If followup also fails, ignore to prevent further errors
-
-# WITHDRAW
-@bot.tree.command(name="withdraw", description="Withdraw your balance to your Litecoin address")
+# WITHDRAW (Modified to use queue system)
+@bot.tree.command(name="withdraw", description="Request a withdrawal to your Litecoin address (goes to admin queue)")
 async def withdraw(interaction: discord.Interaction, amount_usd: float, ltc_address: str):
-    global ltc_handler
     user_id = str(interaction.user.id)
     init_user(user_id)
 
@@ -1913,6 +1967,14 @@ async def withdraw(interaction: discord.Interaction, amount_usd: float, ltc_addr
     can_proceed, remaining_time = check_cooldown(user_id)
     if not can_proceed:
         await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    if amount_usd <= 0:
+        await interaction.response.send_message("❌ Withdrawal amount must be positive!", ephemeral=True)
+        return
+
+    if amount_usd < 1.00:
+        await interaction.response.send_message("❌ Minimum withdrawal is $1.00 USD!", ephemeral=True)
         return
 
     if balances[user_id]["balance"] < amount_usd:
@@ -1925,46 +1987,49 @@ async def withdraw(interaction: discord.Interaction, amount_usd: float, ltc_addr
         await interaction.response.send_message("❌ Invalid Litecoin address format!", ephemeral=True)
         return
 
-    if not ltc_handler:
-        await interaction.response.send_message("❌ Automatic withdrawals are currently unavailable. Please try again later.", ephemeral=True)
-        return
-
-    try:
-        ltc_price_usd = await get_ltc_price()
-        ltc_amount = amount_usd / ltc_price_usd
-
-        if ltc_amount < 0.001:
-            await interaction.response.send_message(f"❌ Minimum withdrawal is $1.00 USD (approximately 0.001 LTC)", ephemeral=True)
+    # Check if user already has a pending withdrawal
+    withdrawal_queue = load_withdrawal_queue()
+    for withdrawal_id, withdrawal_data in withdrawal_queue.items():
+        if withdrawal_data['user_id'] == user_id:
+            await interaction.response.send_message("❌ You already have a pending withdrawal request! Please wait for it to be processed.", ephemeral=True)
             return
 
-        # Attempt withdrawal from house wallet
-        tx_hash = await ltc_handler.withdraw_from_house_wallet(ltc_address, ltc_amount)
+    # Deduct amount from balance and add to queue
+    balances[user_id]["balance"] -= amount_usd
+    save_balances(balances)
 
-        if tx_hash:
-            # Successful withdrawal
-            balances[user_id]["balance"] -= amount_usd
-            balances[user_id]["withdrawn"] += amount_usd
-            save_balances(balances)
+    # Generate unique withdrawal ID
+    withdrawal_id = str(int(time.time() * 1000))  # Timestamp in milliseconds
 
-            embed = discord.Embed(
-                title="✅ Litecoin Withdrawal Successful! 🎉",
-                color=0x00ff00
-            )
-            embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
-            embed.add_field(name="🪙 LTC Amount", value=f"{ltc_amount:.6f} LTC", inline=True)
-            embed.add_field(name="📍 Address", value=f"`{ltc_address}`", inline=False)
-            embed.add_field(name="🧾 Transaction Hash", value=f"`{tx_hash}`", inline=False)
-            embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
-            embed.set_footer(text="⚡ Withdrawal processed from house wallet!")
+    # Add to withdrawal queue
+    withdrawal_queue[withdrawal_id] = {
+        "user_id": user_id,
+        "username": interaction.user.display_name,
+        "amount_usd": amount_usd,
+        "ltc_address": ltc_address,
+        "timestamp": time.time(),
+        "status": "pending"
+    }
+    save_withdrawal_queue(withdrawal_queue)
 
-            await interaction.response.send_message(embed=embed)
-            await log_withdraw(interaction.user, amount_usd, ltc_address)
-        else:
-            await interaction.response.send_message("❌ Withdrawal failed. Insufficient house balance or technical error. Please contact an admin.", ephemeral=True)
+    # Get LTC equivalent for display
+    ltc_price = await get_ltc_price()
+    ltc_amount = amount_usd / ltc_price
 
-    except Exception as e:
-        print(f"Withdrawal error: {e}")
-        await interaction.response.send_message("❌ Withdrawal failed due to technical error. Please contact an admin.", ephemeral=True)
+    embed = discord.Embed(
+        title="📝 Withdrawal Request Submitted!",
+        description="Your withdrawal request has been added to the admin queue",
+        color=0xffaa00
+    )
+    embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+    embed.add_field(name="🪙 LTC Equivalent", value=f"~{ltc_amount:.6f} LTC", inline=True)
+    embed.add_field(name="📍 Address", value=f"`{ltc_address}`", inline=False)
+    embed.add_field(name="🆔 Request ID", value=f"`{withdrawal_id}`", inline=True)
+    embed.add_field(name="⏳ Status", value="Pending admin approval", inline=True)
+    embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+    embed.set_footer(text="You will be notified when your withdrawal is processed")
+
+    await interaction.response.send_message(embed=embed)
 
 # ADMIN: HOUSE BALANCE
 @bot.tree.command(name="housebalance", description="Admin command to check the house wallet balance")
@@ -2079,238 +2144,248 @@ async def housedeposit(interaction: discord.Interaction):
 async def test(interaction: discord.Interaction):
     await interaction.response.send_message("Bot is working! ✅")
 
-# DEBUG DEPOSIT
-@bot.tree.command(name="debugdeposit", description="Debug your deposit address and webhook status")
-async def debugdeposit(interaction: discord.Interaction):
-    global ltc_handler
-    user_id = str(interaction.user.id)
+# CONFIRM DEPOSIT COMMAND
+@bot.tree.command(name="confirmdeposit", description="Admin command to credit a user's balance and update their total deposited")
+async def confirmdeposit(interaction: discord.Interaction, member: discord.Member, amount_usd: float):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
 
+    # Check cooldown for the admin user
+    can_proceed, remaining_time = check_cooldown(str(interaction.user.id))
+    if not can_proceed:
+        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    user_id = str(member.id)
+    init_user(user_id)
+
+    # Update user's balance and total deposited
+    balances[user_id]["balance"] += amount_usd
+    balances[user_id]["deposited"] += amount_usd
+    save_balances(balances)
+
+    embed = discord.Embed(
+        title="✅ Deposit Confirmed & Credited!",
+        color=0x00ff00
+    )
+    embed.add_field(name="👤 User", value=member.display_name, inline=True)
+    embed.add_field(name="💵 Amount Credited", value=f"${amount_usd:.2f} USD", inline=True)
+    embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+    embed.add_field(name="⬇️ Total Deposited", value=f"${balances[user_id]['deposited']:.2f} USD", inline=True)
+    embed.set_footer(text="Deposit manually confirmed by an administrator.")
+
+    await interaction.response.send_message(embed=embed)
+
+    # Notify the user
     try:
-        # Check if user has an address
-        try:
-            with open('crypto_addresses.json', 'r') as f:
-                mappings = json.load(f)
-
-            user_address = None
-            for address, data in mappings.items():
-                if data.get('user_id') == user_id:
-                    user_address = address
-                    break
-        except FileNotFoundError:
-            mappings = {}
-            user_address = None
-
-        # Check pending transactions
-        try:
-            with open('pending_transactions.json', 'r') as f:
-                pending = json.load(f)
-        except FileNotFoundError:
-            pending = {}
-
-        # Check notifications
-        try:
-            with open('notifications.json', 'r') as f:
-                notifications = json.load(f)
-        except FileNotFoundError:
-            notifications = []
-
-        embed = discord.Embed(
-            title="🔍 Deposit Debug Information",
-            color=0x0099ff
+        user_embed = discord.Embed(
+            title="✅ Deposit Credited",
+            description="An administrator has credited your account",
+            color=0x00ff00
         )
+        user_embed.add_field(name="💵 Amount Credited", value=f"${amount_usd:.2f} USD", inline=True)
+        user_embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+        user_embed.add_field(name="👑 Processed by", value=interaction.user.display_name, inline=True)
+        user_embed.set_footer(text="Contact an admin if you have questions about this credit")
 
-        if user_address:
-            embed.add_field(name="📍 Your Address", value=f"`{user_address}`", inline=False)
+        await member.send(embed=user_embed)
+    except discord.Forbidden:
+        print(f"Could not send deposit confirmation to user {user_id} - DMs disabled")
+    except Exception as e:
+        print(f"Error sending deposit confirmation: {e}")
 
-            # Check balance on blockchain
-            if ltc_handler:
-                try:
-                    balance = await ltc_handler.get_address_balance(user_address)
-                    embed.add_field(name="🪙 Address Balance", value=f"{balance:.8f} LTC", inline=True)
-                except:
-                    embed.add_field(name="🪙 Address Balance", value="Error checking", inline=True)
-        else:
-            embed.add_field(name="📍 Your Address", value="None generated yet", inline=False)
+# QUEUE COMMAND
+@bot.tree.command(name="queue", description="Admin command to view all pending withdrawal requests")
+async def queue(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
 
-        # Show pending transactions for this user
-        user_pending = {k: v for k, v in pending.items() if v.get('user_id') == user_id}
-        if user_pending:
-            pending_text = ""
-            for tx_hash, tx_info in user_pending.items():
-                status = "✅ Confirmed" if tx_info.get('confirmed') else "⏳ Pending"
-                notif_sent = "📧 Sent" if tx_info.get('notification_sent') else "📧 Pending"
-                pending_text += f"{tx_hash[:8]}... - {tx_info['amount_ltc']:.6f} LTC - {status} - {notif_sent}\n"
-            embed.add_field(name="📋 Your Transactions", value=pending_text or "None", inline=False)
-        else:
-            embed.add_field(name="📋 Your Transactions", value="None found", inline=False)
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(interaction.user.id))
+    if not can_proceed:
+        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
 
-        embed.add_field(name="🔗 Webhook URL", value="https://vaultbot-gambling.replit.app/webhook/litecoin", inline=False)
-        embed.add_field(name="📊 Total Addresses", value=f"{len(mappings)}", inline=True)
-        embed.add_field(name="⏳ Pending Count", value=f"{len(pending)}", inline=True)
-        embed.add_field(name="🔔 Notifications", value=f"{len(notifications)}", inline=True)
+    withdrawal_queue = load_withdrawal_queue()
 
+    if not withdrawal_queue:
+        embed = discord.Embed(
+            title="📋 Withdrawal Queue",
+            description="No pending withdrawal requests",
+            color=0x00ff00
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
 
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Debug error: {str(e)}", ephemeral=True)
+    # Sort by timestamp (oldest first)
+    sorted_withdrawals = sorted(withdrawal_queue.items(), key=lambda x: x[1]['timestamp'])
 
-# MANUAL CHECK TRANSACTIONS
-@bot.tree.command(name="checktransactions", description="Manually check for confirmed transactions and process them")
-async def checktransactions(interaction: discord.Interaction):
-    global ltc_handler
-    user_id = str(interaction.user.id)
+    embed = discord.Embed(
+        title="📋 Pending Withdrawal Requests",
+        description=f"Total requests: {len(sorted_withdrawals)}",
+        color=0xffaa00
+    )
 
-    await interaction.response.defer(ephemeral=True)
+    queue_text = ""
+    for i, (withdrawal_id, data) in enumerate(sorted_withdrawals[:10], 1):  # Show max 10
+        timestamp = data['timestamp']
+        time_ago = int(time.time() - timestamp)
+        hours = time_ago // 3600
+        minutes = (time_ago % 3600) // 60
 
+        time_str = f"{hours}h {minutes}m ago" if hours > 0 else f"{minutes}m ago"
+
+        queue_text += f"**{i}.** {data['username']}\n"
+        queue_text += f"   💵 ${data['amount_usd']:.2f} USD\n"
+        queue_text += f"   📍 `{data['ltc_address'][:20]}...`\n"
+        queue_text += f"   🆔 ID: `{withdrawal_id}`\n"
+        queue_text += f"   ⏰ {time_str}\n\n"
+
+    if len(queue_text) > 1024:  # Discord field limit
+        queue_text = queue_text[:1000] + "..."
+
+    embed.add_field(name="📋 Queue", value=queue_text if queue_text else "No pending requests", inline=False)
+
+    if len(sorted_withdrawals) > 10:
+        embed.set_footer(text=f"Showing 10 of {len(sorted_withdrawals)} requests. Use /confirmwithdraw to process them.")
+    else:
+        embed.set_footer(text="Use /confirmwithdraw [withdrawal_id] to process requests")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# CONFIRM WITHDRAW COMMAND
+@bot.tree.command(name="confirmwithdraw", description="Admin command to confirm and process a withdrawal from the queue")
+async def confirmwithdraw(interaction: discord.Interaction, withdrawal_id: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(interaction.user.id))
+    if not can_proceed:
+        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    withdrawal_queue = load_withdrawal_queue()
+
+    if withdrawal_id not in withdrawal_queue:
+        await interaction.response.send_message("❌ Withdrawal request not found! Use `/queue` to see pending requests.", ephemeral=True)
+        return
+
+    withdrawal_data = withdrawal_queue[withdrawal_id]
+    user_id = withdrawal_data['user_id']
+    amount_usd = withdrawal_data['amount_usd']
+    ltc_address = withdrawal_data['ltc_address']
+    username = withdrawal_data['username']
+
+    # Remove from queue
+    del withdrawal_queue[withdrawal_id]
+    save_withdrawal_queue(withdrawal_queue)
+
+    # Update user's withdrawn stat
+    init_user(user_id)
+    balances[user_id]["withdrawn"] += amount_usd
+    save_balances(balances)
+
+    embed = discord.Embed(
+        title="✅ Withdrawal Confirmed & Processed!",
+        color=0x00ff00
+    )
+    embed.add_field(name="👤 User", value=username, inline=True)
+    embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+    embed.add_field(name="📍 Address", value=f"`{ltc_address}`", inline=False)
+    embed.add_field(name="🆔 Request ID", value=f"`{withdrawal_id}`", inline=True)
+    embed.add_field(name="📊 User's Total Withdrawn", value=f"${balances[user_id]['withdrawn']:.2f} USD", inline=True)
+    embed.set_footer(text="Withdrawal manually processed by administrator")
+
+    await interaction.response.send_message(embed=embed)
+
+    # Notify the user
     try:
-        print(f"🔍 Manual transaction check requested by user {user_id}")
+        user = bot.get_user(int(user_id))
+        if user:
+            ltc_price = await get_ltc_price()
+            ltc_amount = amount_usd / ltc_price
 
-        if not ltc_handler:
-            # Try to reinitialize the handler
-            if BLOCKCYPHER_API_KEY:
-                try:
-                    from crypto_handler import init_litecoin_handler
-                    ltc_handler = init_litecoin_handler(BLOCKCYPHER_API_KEY, WEBHOOK_SECRET, bot)
-                    if not ltc_handler:
-                        await interaction.followup.send("❌ Crypto handler not available - failed to initialize", ephemeral=True)
-                        return
-                except Exception as e:
-                    await interaction.followup.send(f"❌ Crypto handler not available - initialization error: {str(e)}", ephemeral=True)
-                    return
-            else:
-                await interaction.followup.send("❌ Crypto handler not available - API key missing", ephemeral=True)
-                return
+            user_embed = discord.Embed(
+                title="✅ Withdrawal Processed!",
+                description="Your withdrawal request has been approved and processed",
+                color=0x00ff00
+            )
+            user_embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+            user_embed.add_field(name="🪙 LTC Equivalent", value=f"~{ltc_amount:.6f} LTC", inline=True)
+            user_embed.add_field(name="📍 Address", value=f"`{ltc_address}`", inline=False)
+            user_embed.add_field(name="⏰ Status", value="✅ Complete", inline=True)
+            user_embed.set_footer(text="Your funds have been sent manually by an administrator")
 
-        # Load pending transactions
-        try:
-            with open('pending_transactions.json', 'r') as f:
-                pending = json.load(f)
-                print(f"🔍 Loaded {len(pending)} pending transactions")
-        except FileNotFoundError:
-            print(f"🔍 No pending transactions file found")
-            await interaction.followup.send("❌ No pending transactions found", ephemeral=True)
-            return
-
-        user_transactions = {k: v for k, v in pending.items() if v.get('user_id') == user_id}
-        print(f"🔍 Found {len(user_transactions)} transactions for user {user_id}")
-
-        if not user_transactions:
-            await interaction.followup.send("❌ No pending transactions found for your account", ephemeral=True)
-            return
-
-        processed_count = 0
-        status_info = []
-
-        for tx_hash, tx_info in user_transactions.items():
-            try:
-                # Check transaction status on blockchain
-                tx_details = await ltc_handler.get_transaction_details(tx_hash)
-                if tx_details:
-                    confirmations = tx_details.get('confirmations', 0)
-                    print(f"🔍 Transaction {tx_hash[:8]}... has {confirmations} confirmations")
-                    status_info.append(f"Transaction {tx_hash[:8]}... - {confirmations} confirmations")
-
-                    if confirmations >= 1 and not tx_info.get('confirmed'):
-                        # Process this confirmed transaction
-                        amount_ltc = tx_info.get('amount_ltc', 0)
-                        ltc_price = await get_ltc_price()
-                        amount_usd = amount_ltc * ltc_price
-
-                        print(f"🔍 Processing confirmed transaction: {amount_ltc} LTC = ${amount_usd:.2f} USD")
-
-                        # Update balance
-                        balances = load_balances()
-                        init_user(user_id)
-                        old_balance = balances[user_id]["balance"]
-                        balances[user_id]["balance"] += amount_usd
-                        balances[user_id]["deposited"] += amount_usd
-                        save_balances(balances)
-
-                        print(f"🔍 Balance updated: ${old_balance:.2f} -> ${balances[user_id]['balance']:.2f}")
-
-                        # Mark as confirmed
-                        pending[tx_hash]['confirmed'] = True
-                        pending[tx_hash]['notification_sent'] = True
-
-                        # Create notification
-                        notification = {
-                            'type': 'deposit_confirmed',
-                            'user_id': user_id,
-                            'amount_ltc': amount_ltc,
-                            'amount_usd': amount_usd,
-                            'tx_hash': tx_hash,
-                            'address': tx_info.get('address', ''),
-                            'timestamp': time.time()
-                        }
-
-                        try:
-                            try:
-                                with open('notifications.json', 'r') as f:
-                                    notifications = json.load(f)
-                            except (FileNotFoundError, json.JSONDecodeError):
-                                notifications = []
-
-                            notifications.append(notification)
-
-                            with open('notifications.json', 'w') as f:
-                                json.dump(notifications, f, indent=2)
-
-                            print(f"🔍 Created notification for transaction {tx_hash[:8]}...")
-                        except Exception as notif_error:
-                            print(f"❌ Error creating notification: {notif_error}")
-
-                        processed_count += 1
-                        print(f"✅ Manually processed confirmed transaction: {tx_hash[:8]}...")
-
-                        # Send immediate notification
-                        user = bot.get_user(int(user_id))
-                        if user:
-                            embed = discord.Embed(
-                                title="✅ Deposit Confirmed & Credited!",
-                                description="Your Litecoin deposit has been successfully processed (manual check)",
-                                color=0x00ff00
-                            )
-                            embed.add_field(name="💰 Amount", value=f"{amount_ltc:.8f} LTC", inline=True)
-                            embed.add_field(name="💵 USD Value", value=f"${amount_usd:.2f} USD", inline=True)
-                            embed.add_field(name="🔗 Transaction", value=f"`{tx_hash[:16]}...`", inline=False)
-                            embed.add_field(name="🎮 Status", value="Balance updated - ready to play!", inline=True)
-                            embed.set_footer(text="Your deposit has been automatically credited")
-
-                            await user.send(embed=embed)
-                            await log_deposit(user, amount_usd)
-                    elif tx_info.get('confirmed'):
-                        status_info.append(f"Already processed: {tx_hash[:8]}...")
-                else:
-                    print(f"🔍 Could not get details for transaction {tx_hash[:8]}...")
-                    status_info.append(f"Error checking: {tx_hash[:8]}...")
-
-            except Exception as e:
-                print(f"❌ Error processing transaction {tx_hash}: {e}")
-                status_info.append(f"Error: {tx_hash[:8]}... - {str(e)}")
-
-        # Save updated pending transactions
-        if processed_count > 0:
-            with open('pending_transactions.json', 'w') as f:
-                json.dump(pending, f, indent=2)
-            print(f"🔍 Saved updated pending transactions")
-
-        # Prepare response
-        response_text = f"🔍 **Transaction Check Results:**\n\n"
-        if status_info:
-            response_text += "\n".join(status_info) + "\n\n"
-
-        if processed_count > 0:
-            response_text += f"✅ Successfully processed {processed_count} confirmed transaction(s)! Check your balance with `/balance`."
-        else:
-            response_text += "ℹ️ No new confirmed transactions found. Your transactions may still be pending confirmation on the blockchain."
-
-        await interaction.followup.send(response_text, ephemeral=True)
-
+            await user.send(embed=user_embed)
+            await log_withdraw(user, amount_usd, ltc_address)
+    except discord.Forbidden:
+        print(f"Could not send withdrawal confirmation to user {user_id} - DMs disabled")
     except Exception as e:
-        print(f"❌ Error in manual transaction check: {e}")
-        import traceback
-        traceback.print_exc()
-        await interaction.followup.send(f"❌ Error checking transactions: {str(e)}", ephemeral=True)
+        print(f"Error sending withdrawal confirmation: {e}")
+
+# REMOVE BALANCE COMMAND
+@bot.tree.command(name="removebalance", description="Admin command to remove balance from a user")
+async def removebalance(interaction: discord.Interaction, member: discord.Member, amount_usd: float):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(interaction.user.id))
+    if not can_proceed:
+        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    if amount_usd <= 0:
+        await interaction.response.send_message("❌ Amount must be positive!", ephemeral=True)
+        return
+
+    user_id = str(member.id)
+    init_user(user_id)
+
+    current_balance = balances[user_id]["balance"]
+
+    if current_balance < amount_usd:
+        await interaction.response.send_message(f"❌ User only has ${current_balance:.2f} USD but you tried to remove ${amount_usd:.2f} USD!", ephemeral=True)
+        return
+
+    # Remove the balance
+    balances[user_id]["balance"] -= amount_usd
+    save_balances(balances)
+
+    embed = discord.Embed(
+        title="💸 Balance Removed Successfully",
+        color=0xff6600
+    )
+    embed.add_field(name="👤 User", value=member.display_name, inline=True)
+    embed.add_field(name="💵 Amount Removed", value=f"${amount_usd:.2f} USD", inline=True)
+    embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+    embed.add_field(name="👑 Admin", value=interaction.user.display_name, inline=True)
+    embed.set_footer(text="Balance manually removed by administrator")
+
+    await interaction.response.send_message(embed=embed)
+
+    # Notify the user
+    try:
+        user_embed = discord.Embed(
+            title="💸 Balance Adjustment",
+            description="An administrator has adjusted your balance",
+            color=0xff6600
+        )
+        user_embed.add_field(name="💵 Amount Removed", value=f"${amount_usd:.2f} USD", inline=True)
+        user_embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+        user_embed.add_field(name="👑 Processed by", value=interaction.user.display_name, inline=True)
+        user_embed.set_footer(text="Contact an admin if you have questions about this adjustment")
+
+        await member.send(embed=user_embed)
+    except discord.Forbidden:
+        print(f"Could not send balance removal notification to user {user_id} - DMs disabled")
+    except Exception as e:
+        print(f"Error sending balance removal notification: {e}")
 
 # AFFILIATE
 @bot.tree.command(name="affiliate", description="Affiliate yourself to another player to give them 0.5% of your wagers")
@@ -2417,8 +2492,7 @@ async def help_command(interaction: discord.Interaction):
 💸 `/tip [user] [amount]` - Send money to another player
 🎁 `/claimrakeback` - Claim 0.5% of your total wagered
 🤝 `/affiliate [user]` - Affiliate to a player (they get 0.5% of your wagers)
-💎 `/deposit` - Generate a Litecoin deposit address
-📤 `/withdraw [amount] [address]` - Withdraw to crypto address
+📤 `/withdraw [amount] [address]` - Request withdrawal (goes to admin queue)
 🏆 `/leaderboard [category]` - View top players
     """
 
@@ -2436,13 +2510,14 @@ async def help_command(interaction: discord.Interaction):
     if is_admin(interaction.user.id):
         admin_text = """
 💳 `/addbalance [user] [amount]` - Add balance to user account
+💸 `/removebalance [user] [amount]` - Remove balance from user account
 🔄 `/resetstats [user]` - Reset user's complete account
+📋 `/queue` - View pending withdrawal requests
+✅ `/confirmwithdraw [withdrawal_id]` - Process withdrawal from queue
+✅ `/confirmdeposit [user] [amount]` - Credit a user's balance manually
 🏦 `/housebalance` - Check house wallet balance
 📤 `/housewithdraw [amount] [address]` - Withdraw from house wallet
 💰 `/housedeposit` - Get house wallet address for deposits
-🔍 `/debugdeposit` - Debug your deposit address and webhook status
-❓ `/checktransactions` - Manually check for confirmed transactions
-🚨 `/forcecheckdeposits` - Force check all addresses for confirmed transactions
         """
         embed.add_field(name="👑 Admin Commands", value=admin_text, inline=False)
 
@@ -2452,185 +2527,6 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text="🎲 Good luck and gamble responsibly!")
 
     await interaction.response.send_message(embed=embed)
-
-# FORCE CHECK ALL DEPOSITS
-@bot.tree.command(name="forcecheckdeposits", description="Force check all addresses for confirmed transactions and process them immediately")
-async def forcecheckdeposits(interaction: discord.Interaction):
-    if not is_admin(interaction.user.id):
-        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        print(f"🚨 FORCE CHECK: Admin force checking all deposits...")
-
-        # Load all addresses
-        with open('crypto_addresses.json', 'r') as f:
-            address_mappings = json.load(f)
-
-        processed_count = 0
-        total_addresses = len(address_mappings)
-
-        if not ltc_handler:
-            await interaction.followup.send("❌ Crypto handler not available", ephemeral=True)
-            return
-
-        for address, addr_data in address_mappings.items():
-            user_id = addr_data['user_id']
-            print(f"🚨 Checking address {address} for user {user_id}...")
-
-            try:
-                # Get all transactions for this address
-                async with aiohttp.ClientSession() as session:
-                    url = f"{ltc_handler.base_url}/addrs/{address}/full"
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            addr_full_data = await response.json()
-                            transactions = addr_full_data.get('txs', [])
-
-                            # Load existing processed transactions
-                            try:
-                                with open('pending_transactions.json', 'r') as f:
-                                    pending = json.load(f)
-                            except FileNotFoundError:
-                                pending = {}
-
-                            for tx in transactions:
-                                tx_hash = tx['hash']
-                                confirmations = tx.get('confirmations', 0)
-
-                                # Skip if already processed
-                                if tx_hash in pending and pending[tx_hash].get('confirmed'):
-                                    continue
-
-                                # Only process confirmed transactions
-                                if confirmations >= 1:
-                                    # Check if this is an incoming transaction
-                                    incoming_amount = 0
-                                    for output in tx.get('outputs', []):
-                                        if address in output.get('addresses', []):
-                                            incoming_amount += output.get('value', 0) / 100000000
-
-                                    if incoming_amount > 0:
-                                        print(f"🚨 FORCE: Processing transaction {tx_hash[:8]}... for user {user_id}")
-                                        print(f"    Amount: {incoming_amount:.8f} LTC, Confirmations: {confirmations}")
-
-                                        # Convert to USD
-                                        ltc_price = await get_ltc_price()
-                                        amount_usd = incoming_amount * ltc_price
-
-                                        # Update balance
-                                        balances = load_balances()
-                                        if user_id not in balances:
-                                            balances[user_id] = {"balance": 0.0, "deposited": 0.0, "withdrawn": 0.0, "wagered": 0.0}
-
-                                        old_balance = balances[user_id]["balance"]
-                                        balances[user_id]["balance"] += amount_usd
-                                        balances[user_id]["deposited"] += amount_usd
-                                        save_balances(balances)
-
-                                        print(f"🚨 FORCE: Balance updated for user {user_id}: ${old_balance:.2f} -> ${balances[user_id]['balance']:.2f}")
-
-                                        # Send notification
-                                        user = bot.get_user(int(user_id))
-                                        if user:
-                                            embed = discord.Embed(
-                                                title="🚨 Deposit Found & Credited! (Force Check)",
-                                                description="Admin force check found and processed your deposit!",
-                                                color=0xff0000
-                                            )
-                                            embed.add_field(name="💰 Amount", value=f"{incoming_amount:.8f} LTC", inline=True)
-                                            embed.add_field(name="💵 USD Value", value=f"${amount_usd:.2f} USD", inline=True)
-                                            embed.add_field(name="🔗 Transaction", value=f"`{tx_hash[:16]}...`", inline=False)
-                                            embed.add_field(name="✅ Confirmations", value=f"{confirmations}", inline=True)
-                                            embed.add_field(name="🎮 Status", value="Balance updated - ready to play!", inline=True)
-                                            embed.set_footer(text="Your deposit has been credited!")
-
-                                            try:
-                                                await user.send(embed=embed)
-                                                print(f"🚨 FORCE: Sent notification to user {user_id}")
-                                                await log_deposit(user, amount_usd)
-                                            except Exception as dm_error:
-                                                print(f"❌ Error sending DM: {dm_error}")
-
-                                        # Record as processed
-                                        pending[tx_hash] = {
-                                            'user_id': user_id,
-                                            'address': address,
-                                            'amount_ltc': incoming_amount,
-                                            'confirmed': True,
-                                            'notification_sent': True,
-                                            'processed_by': 'admin_force_check',
-                                            'confirmations': confirmations,
-                                            'timestamp': asyncio.get_event_loop().time()
-                                        }
-
-                                        processed_count += 1
-                                        print(f"🚨 FORCE: Processed transaction {tx_hash[:8]}...")
-
-                            # Save updated pending transactions
-                            with open('pending_transactions.json', 'w') as f:
-                                json.dump(pending, f, indent=2)
-
-            except Exception as e:
-                print(f"❌ Error in force check for address {address}: {e}")
-
-        await interaction.followup.send(f"✅ Force check complete!\n📊 Checked {total_addresses} addresses\n✅ Processed {processed_count} confirmed transactions", ephemeral=True)
-
-    except Exception as e:
-        print(f"❌ Error in force check: {e}")
-        await interaction.followup.send(f"❌ Error in force check: {str(e)}", ephemeral=True)
-
-# CHECK ADDRESS ON BLOCKCHAIN
-@bot.tree.command(name="checkaddress", description="Check your deposit address directly on the blockchain")
-async def checkaddress(interaction: discord.Interaction):
-    global ltc_handler
-    user_id = str(interaction.user.id)
-
-    try:
-        # Check if user has an address
-        try:
-            with open('crypto_addresses.json', 'r') as f:
-                mappings = json.load(f)
-            user_address = None
-            for address, data in mappings.items():
-                if data.get('user_id') == user_id:
-                    user_address = address
-                    break
-        except FileNotFoundError:
-            mappings = {}
-            user_address = None
-
-        if not user_address:
-            await interaction.response.send_message("❌ You do not have a deposit address generated yet. Use `/deposit` first.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        if not ltc_handler:
-            await interaction.followup.send("❌ Crypto handler is not available. Cannot check address balance.", ephemeral=True)
-            return
-
-        balance_ltc = await ltc_handler.get_address_balance(user_address)
-        ltc_price = await get_ltc_price()
-        balance_usd = balance_ltc * ltc_price
-
-        embed = discord.Embed(
-            title="🔍 Deposit Address Balance Check",
-            color=0x0099ff
-        )
-        embed.add_field(name="📍 Your Deposit Address", value=f"`{user_address}`", inline=False)
-        embed.add_field(name="🪙 LTC Balance", value=f"{balance_ltc:.8f} LTC", inline=True)
-        embed.add_field(name="💵 USD Value", value=f"${balance_usd:.2f} USD", inline=True)
-        embed.add_field(name="💱 Current LTC Price", value=f"${ltc_price:.2f} USD", inline=True)
-        embed.set_footer(text="This shows the balance directly on the blockchain.")
-
-        await interaction.followup.send(embed=embed)
-
-    except Exception as e:
-        await interaction.followup.send(f"❌ An error occurred while checking your address: {str(e)}", ephemeral=True)
-
 
 if __name__ == "__main__":
     if not TOKEN:
