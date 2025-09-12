@@ -14,15 +14,20 @@ load_dotenv()
 
 # Load environment variables directly from os.environ (works with Replit Secrets)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_ID", "").split(",") if id.strip()]
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 BLOCKCYPHER_API_KEY = os.getenv("BLOCKCYPHER_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+DEPOSIT_LOG_CHANNEL_ID = int(os.getenv("DEPOSIT_LOG_CHANNEL_ID", "1412728845500678235"))
+WITHDRAW_LOG_CHANNEL_ID = int(os.getenv("WITHDRAW_LOG_CHANNEL_ID", "1412730247987855370"))
 
 # Debug: Print if keys are loaded
 print(f"Environment check:")
 print(f"- Discord token: {'✅' if TOKEN else '❌'}")
+print(f"- Admin IDs: {ADMIN_IDS if ADMIN_IDS else '❌ None configured'}")
 print(f"- BlockCypher key: {'✅' if BLOCKCYPHER_API_KEY else '❌'}")
 print(f"- Webhook secret: {'✅' if WEBHOOK_SECRET else '❌'}")
+print(f"- Deposit log channel: {DEPOSIT_LOG_CHANNEL_ID}")
+print(f"- Withdraw log channel: {WITHDRAW_LOG_CHANNEL_ID}")
 
 # Set up intents for Discord bot
 intents = discord.Intents.default()
@@ -190,6 +195,28 @@ async def log_deposit(member, amount_usd):
         embed.add_field(name="📊 Total Deposited by User", value=f"${balances[str(member.id)]['deposited']:.2f} USD", inline=True)
         await channel.send(embed=embed)
 
+async def log_admin_deposit(admin_member, target_member, amount_usd):
+    """Log admin-confirmed deposits to the admin deposit log channel"""
+    log_channel = bot.get_channel(DEPOSIT_LOG_CHANNEL_ID)
+    if log_channel:
+        embed = discord.Embed(
+            title="🔧 Admin Deposit Confirmation",
+            description="An administrator has manually credited a user's account",
+            color=0x0099ff
+        )
+        embed.add_field(name="👑 Admin", value=f"{admin_member.display_name} ({admin_member.id})", inline=True)
+        embed.add_field(name="👤 User Credited", value=f"{target_member.display_name} ({target_member.id})", inline=True)
+        embed.add_field(name="💵 Amount Credited", value=f"${amount_usd:.2f} USD", inline=True)
+        embed.add_field(name="💳 User's New Balance", value=f"${balances[str(target_member.id)]['balance']:.2f} USD", inline=True)
+        embed.add_field(name="📊 User's Total Deposited", value=f"${balances[str(target_member.id)]['deposited']:.2f} USD", inline=True)
+        embed.add_field(name="⏰ Timestamp", value=f"<t:{int(time.time())}:F>", inline=True)
+        embed.set_footer(text="Manual deposit confirmation by administrator")
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send admin deposit log: {e}")
+
 async def log_withdraw(member, amount_usd, crypto_address):
     withdraw_channel_id = 1403907128023842996
     channel = bot.get_channel(withdraw_channel_id)
@@ -202,6 +229,99 @@ async def log_withdraw(member, amount_usd, crypto_address):
         embed.add_field(name="💵 Amount Withdrawn", value=f"${amount_usd:.2f} USD", inline=True)
         embed.add_field(name="📍 Crypto Address", value=f"`{crypto_address}`", inline=False)
         await channel.send(embed=embed)
+
+async def log_admin_withdraw(admin_member, target_member, amount_usd, ltc_address, withdrawal_id):
+    """Log admin-confirmed withdrawals to the admin withdraw log channel"""
+    log_channel = bot.get_channel(WITHDRAW_LOG_CHANNEL_ID)
+    if log_channel:
+        embed = discord.Embed(
+            title="🔧 Admin Withdrawal Confirmation",
+            description="An administrator has manually processed a withdrawal request",
+            color=0xff6600
+        )
+        embed.add_field(name="👑 Admin", value=f"{admin_member.display_name} ({admin_member.id})", inline=True)
+        embed.add_field(name="👤 User", value=f"{target_member.display_name} ({target_member.id})", inline=True)
+        embed.add_field(name="💵 Amount Withdrawn", value=f"${amount_usd:.2f} USD", inline=True)
+        embed.add_field(name="📍 LTC Address", value=f"`{ltc_address}`", inline=False)
+        embed.add_field(name="🆔 Withdrawal ID", value=f"`{withdrawal_id}`", inline=True)
+        embed.add_field(name="📊 User's Total Withdrawn", value=f"${balances[str(target_member.id)]['withdrawn']:.2f} USD", inline=True)
+        embed.add_field(name="⏰ Timestamp", value=f"<t:{int(time.time())}:F>", inline=True)
+        embed.set_footer(text="Manual withdrawal confirmation by administrator")
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send admin withdraw log: {e}")
+
+async def log_admin_balance_change(admin_member, target_member, amount_usd, action_type):
+    """Log admin balance changes to the specified channel"""
+    log_channel = bot.get_channel(1413123452193341450)
+    if log_channel:
+        embed = discord.Embed(
+            title=f"🔧 Admin Balance {action_type.title()}",
+            description=f"An administrator has {action_type.lower()} user balance",
+            color=0x0099ff if action_type == "Addition" else 0xff6600
+        )
+        embed.add_field(name="👑 Admin", value=f"{admin_member.display_name} ({admin_member.id})", inline=True)
+        embed.add_field(name="👤 Target User", value=f"{target_member.display_name} ({target_member.id})", inline=True)
+        embed.add_field(name="💵 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+        embed.add_field(name="💳 User's New Balance", value=f"${balances[str(target_member.id)]['balance']:.2f} USD", inline=True)
+        embed.add_field(name="⏰ Timestamp", value=f"<t:{int(time.time())}:F>", inline=True)
+        embed.set_footer(text=f"Manual balance {action_type.lower()} by administrator")
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send admin balance change log: {e}")
+
+async def log_tip_transaction(sender, receiver, amount_usd):
+    """Log tip transactions to the specified channel"""
+    log_channel = bot.get_channel(1413123467171336273)
+    if log_channel:
+        embed = discord.Embed(
+            title="💝 Tip Transaction",
+            description="A user has sent a tip to another player",
+            color=0x00ff00
+        )
+        embed.add_field(name="👤 Sender", value=f"{sender.display_name} ({sender.id})", inline=True)
+        embed.add_field(name="👤 Receiver", value=f"{receiver.display_name} ({receiver.id})", inline=True)
+        embed.add_field(name="💰 Amount", value=f"${amount_usd:.2f} USD", inline=True)
+        embed.add_field(name="💳 Sender's New Balance", value=f"${balances[str(sender.id)]['balance']:.2f} USD", inline=True)
+        embed.add_field(name="💳 Receiver's New Balance", value=f"${balances[str(receiver.id)]['balance']:.2f} USD", inline=True)
+        embed.add_field(name="⏰ Timestamp", value=f"<t:{int(time.time())}:F>", inline=True)
+        embed.set_footer(text="Player tip transaction")
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send tip transaction log: {e}")
+
+async def log_affiliation_change(user, affiliate, previous_affiliate=None):
+    """Log affiliation changes to the specified channel"""
+    log_channel = bot.get_channel(1413123467171336273)
+    if log_channel:
+        embed = discord.Embed(
+            title="🤝 Affiliation Update",
+            description="A user has updated their affiliation",
+            color=0x9932cc
+        )
+        embed.add_field(name="👤 User", value=f"{user.display_name} ({user.id})", inline=True)
+        embed.add_field(name="👤 New Affiliate", value=f"{affiliate.display_name} ({affiliate.id})", inline=True)
+
+        if previous_affiliate:
+            embed.add_field(name="👤 Previous Affiliate", value=f"{previous_affiliate.display_name} ({previous_affiliate.id})", inline=True)
+        else:
+            embed.add_field(name="👤 Previous Affiliate", value="None", inline=True)
+
+        embed.add_field(name="💰 Commission Rate", value="0.5%", inline=True)
+        embed.add_field(name="📊 Affiliate's Total Earned", value=f"${affiliation_data[str(affiliate.id)]['total_earned']:.2f} USD", inline=True)
+        embed.add_field(name="⏰ Timestamp", value=f"<t:{int(time.time())}:F>", inline=True)
+        embed.set_footer(text="Affiliation system update")
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send affiliation change log: {e}")
 
 async def get_ltc_price():
     """Get current Litecoin price in USD"""
@@ -441,6 +561,66 @@ async def auto_force_check_deposits():
         print(f"❌ Error in auto force check: {e}")
 
 @bot.event
+async def on_message(message):
+    # Don't track bot messages
+    if message.author.bot:
+        return
+    
+    # Only track messages in guilds (not DMs)
+    if not message.guild:
+        return
+    
+    user_id = str(message.author.id)
+    
+    # Initialize user if not exists
+    if user_id not in message_tracking:
+        message_tracking[user_id] = {"count": 0, "total_rewarded": 0}
+    
+    # Increment message count
+    message_tracking[user_id]["count"] += 1
+    
+    # Check if user reached 100 messages
+    if message_tracking[user_id]["count"] >= 100:
+        # Reset count and give reward
+        message_tracking[user_id]["count"] = 0
+        message_tracking[user_id]["total_rewarded"] += 1
+        
+        # Add $0.10 to user's balance
+        init_user(user_id)
+        balances[user_id]["balance"] += 0.10
+        save_balances(balances)
+        save_message_tracking(message_tracking)
+        
+        # Send reward notification
+        try:
+            embed = discord.Embed(
+                title="💬 Chat Reward! 🎉",
+                description="You've been rewarded for being active in the server!",
+                color=0x00ff00
+            )
+            embed.add_field(name="💰 Reward", value="$0.10 USD", inline=True)
+            embed.add_field(name="📊 Messages Sent", value="100 messages", inline=True)
+            embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+            embed.add_field(name="🎯 Total Rewards", value=f"{message_tracking[user_id]['total_rewarded']} times", inline=True)
+            embed.set_footer(text="Keep chatting to earn more rewards!")
+            
+            await message.author.send(embed=embed)
+        except discord.Forbidden:
+            # User has DMs disabled, send in channel
+            try:
+                embed = discord.Embed(
+                    title="💬 Chat Reward!",
+                    description=f"{message.author.mention} earned $0.10 for 100 messages!",
+                    color=0x00ff00
+                )
+                await message.channel.send(embed=embed, delete_after=10)
+            except:
+                pass
+    else:
+        # Save updated count
+        save_message_tracking(message_tracking)
+
+@bot.event
 async def on_ready():
     global ltc_handler
     print(f"Logged in as {bot.user}")
@@ -643,8 +823,8 @@ async def tip(interaction: discord.Interaction, member: discord.Member, amount_u
         await interaction.response.send_message("❌ Tip amount must be positive!", ephemeral=True)
         return
 
-    if amount_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum tip amount is $0.01 USD!", ephemeral=True)
+    if amount_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum tip amount is $0.10 USD!", ephemeral=True)
         return
 
     if amount_usd > 1000:
@@ -681,6 +861,9 @@ async def tip(interaction: discord.Interaction, member: discord.Member, amount_u
 
     await interaction.response.send_message(embed=embed)
 
+    # Log the tip transaction
+    await log_tip_transaction(interaction.user, member, amount_usd)
+
 # ADMIN: ADD BALANCE
 @bot.tree.command(name="addbalance", description="Admin command to add balance to a user (in USD)")
 async def addbalance(interaction: discord.Interaction, member: discord.Member, amount_usd: float):
@@ -708,6 +891,9 @@ async def addbalance(interaction: discord.Interaction, member: discord.Member, a
     embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
 
     await interaction.response.send_message(embed=embed)
+
+    # Log the admin balance addition
+    await log_admin_balance_change(interaction.user, member, amount_usd, "Addition")
 
 # ADMIN: RESET STATS
 @bot.tree.command(name="resetstats", description="Admin command to reset user stats or entire server stats")
@@ -809,8 +995,8 @@ async def coinflip(interaction: discord.Interaction, choice: str, wager_usd: flo
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if balances[user_id]["balance"] < wager_usd:
@@ -907,8 +1093,8 @@ async def dice(interaction: discord.Interaction, wager_usd: float, choice: str):
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if balances[user_id]["balance"] < wager_usd:
@@ -1004,8 +1190,8 @@ async def rps(interaction: discord.Interaction, choice: str, wager_usd: float):
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if balances[user_id]["balance"] < wager_usd:
@@ -1071,8 +1257,8 @@ async def slots(interaction: discord.Interaction, wager_usd: float):
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if balances[user_id]["balance"] < wager_usd:
@@ -1175,8 +1361,8 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if balances[user_id]["balance"] < wager_usd:
@@ -1287,7 +1473,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
         def check_can_split(self):
             if len(self.player_hands[0]) == 2 and self.split_count < 3:
                 card1, card2 = self.player_hands[0]
-                return card_value(card1) == card_value(card2)
+                return self.card_value(card1) == self.card_value(card2)
             return False
 
         def get_current_hand(self):
@@ -1298,7 +1484,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             for i, hand in enumerate(self.player_hands):
                 indicator = "👉 " if i == self.current_hand_index and not self.hands_completed[i] else "   "
                 status = " ✅" if self.hands_completed[i] else ""
-                result += f"{indicator}Hand {i+1}: {format_hand(hand)} = {hand_value(hand)}{status}\n"
+                result += f"{indicator}Hand {i+1}: {self.format_hand(hand)}{status}\n"
             return result.strip()
 
         @discord.ui.button(label="Hit", style=discord.ButtonStyle.green, emoji="🃏")
@@ -1313,7 +1499,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
 
             current_hand = self.get_current_hand()
             current_hand.append(self.deck.pop())
-            player_value = hand_value(current_hand)
+            player_value = self.hand_value(current_hand)
 
             self.can_double_down = False
             self.can_split = False
@@ -1372,7 +1558,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             self.total_wager += self.wager_usd
             current_hand = self.get_current_hand()
             current_hand.append(self.deck.pop())
-            player_value = hand_value(current_hand)
+            player_value = self.hand_value(current_hand)
 
             self.can_double_down = False
             self.can_split = False
@@ -1442,45 +1628,56 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             self.current_hand_index = len(self.player_hands)
 
         async def create_game_image(self, show_dealer_cards=False):
-            """Create combined game image showing both player and dealer hands"""
+            """Create comprehensive blackjack game image showing all hands"""
             try:
-                current_hand = self.get_current_hand() if self.current_hand_index < len(self.player_hands) else self.player_hands[0]
-                player_img_path = f"temp_player_{self.user_id}_{time.time()}.png"
-                dealer_img_path = f"temp_dealer_{self.user_id}_{time.time()}.png"
+                game_img_path = f"temp_blackjack_{self.user_id}_{time.time()}.png"
 
-                self.card_generator.save_hand_image(current_hand, player_img_path)
-                self.card_generator.save_hand_image(self.dealer_hand, dealer_img_path, hide_first=not show_dealer_cards)
+                # Use the enhanced blackjack image generator
+                success = self.card_generator.save_blackjack_game_image(
+                    self.player_hands, 
+                    self.dealer_hand, 
+                    game_img_path,
+                    self.current_hand_index,
+                    hide_dealer_first=not show_dealer_cards
+                )
 
-                return player_img_path, dealer_img_path
+                return game_img_path if success else None, None
             except Exception as e:
                 print(f"Error creating game images: {e}")
                 return None, None
 
         async def update_display(self, interaction, title):
-            # Create card images
-            player_img, dealer_img = await self.create_game_image(show_dealer_cards=False)
+            # Create comprehensive game image
+            game_img, _ = await self.create_game_image(show_dealer_cards=False)
 
             embed = discord.Embed(title=title, color=0x0099ff)
 
             # Add hand information
             current_hand = self.get_current_hand() if self.current_hand_index < len(self.player_hands) else self.player_hands[0]
-            player_value = hand_value(current_hand)
+            player_value = self.hand_value(current_hand)
 
-            embed.add_field(name="🃏 Your Hand", value=f"{format_hand(current_hand)} = **{player_value}**", inline=True)
-            embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand, hide_first=True)} = **?**", inline=True)
+            if len(self.player_hands) == 1:
+                embed.add_field(name="🃏 Your Hand", value=f"{self.format_hand(current_hand)} = **{player_value}**", inline=True)
+            else:
+                embed.add_field(name="🃏 Current Hand", value=f"Hand {self.current_hand_index + 1}: {self.format_hand(current_hand)} = **{player_value}**", inline=True)
+
+            embed.add_field(name="🤖 Dealer Hand", value=f"{self.format_hand(self.dealer_hand, hide_first=True)} = **?**", inline=True)
             embed.add_field(name="💰 Total Wager", value=f"${self.total_wager:.2f} USD", inline=True)
 
             if len(self.player_hands) > 1:
-                embed.add_field(name="👉 Current Hand", value=f"Hand {self.current_hand_index + 1} of {len(self.player_hands)}", inline=True)
-                embed.add_field(name="🃏 All Hands", value=self.format_all_hands(), inline=False)
+                hands_status = []
+                for i, hand in enumerate(self.player_hands):
+                    status = "🔥 ACTIVE" if i == self.current_hand_index and not self.hands_completed[i] else "✅ DONE" if self.hands_completed[i] else "⏳ WAITING"
+                    hands_status.append(f"Hand {i+1}: {status}")
+                embed.add_field(name="📊 All Hands Status", value="\n".join(hands_status), inline=False)
 
             embed.set_footer(text="Hit: take card | Stand: keep hand | Double Down: double bet + 1 card | Split: split pairs")
 
-            # Attach card images if available
+            # Attach comprehensive game image
             files = []
-            if player_img and os.path.exists(player_img):
-                files.append(discord.File(player_img, filename="player_cards.png"))
-                embed.set_image(url="attachment://player_cards.png")
+            if game_img and os.path.exists(game_img):
+                files.append(discord.File(game_img, filename="blackjack_game.png"))
+                embed.set_image(url="attachment://blackjack_game.png")
 
             try:
                 if interaction.response.is_done():
@@ -1489,12 +1686,11 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
                     await interaction.response.edit_message(embed=embed, view=self, attachments=files)
 
                 # Clean up image files
-                for img_file in [player_img, dealer_img]:
-                    if img_file and os.path.exists(img_file):
-                        try:
-                            os.remove(img_file)
-                        except:
-                            pass
+                if game_img and os.path.exists(game_img):
+                    try:
+                        os.remove(game_img)
+                    except:
+                        pass
 
             except discord.errors.NotFound:
                 try:
@@ -1507,7 +1703,7 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
 
             embed = discord.Embed(title="🃏 Blackjack - Dealer's Turn", color=0xffaa00)
             embed.add_field(name="🃏 Your Final Hands", value=self.format_all_hands(), inline=False)
-            embed.add_field(name="🤖 Dealer Reveals...", value=f"{format_hand(self.dealer_hand)} = {hand_value(self.dealer_hand)}", inline=True)
+            embed.add_field(name="🤖 Dealer Reveals...", value=f"{self.format_hand(self.dealer_hand)} = {self.hand_value(self.dealer_hand)}", inline=True)
             embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
 
             try:
@@ -1521,13 +1717,13 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
 
             await asyncio.sleep(2)
 
-            while hand_value(self.dealer_hand) < 17:
+            while self.hand_value(self.dealer_hand) < 17:
                 self.dealer_hand.append(self.deck.pop())
-                current_dealer_value = hand_value(self.dealer_hand)
+                current_dealer_value = self.hand_value(self.dealer_hand)
 
                 embed = discord.Embed(title="🃏 Blackjack - Dealer Hits", color=0xffaa00)
                 embed.add_field(name="🃏 Your Final Hands", value=self.format_all_hands(), inline=False)
-                embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand)} = {current_dealer_value}", inline=True)
+                embed.add_field(name="🤖 Dealer Hand", value=f"{self.format_hand(self.dealer_hand)} = {current_dealer_value}", inline=True)
                 embed.add_field(name="⏳ Status", value="Dealer is playing...", inline=False)
 
                 try:
@@ -1540,29 +1736,30 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             await self.finish_game(interaction)
 
         async def finish_game(self, interaction):
-            dealer_value = hand_value(self.dealer_hand)
+            dealer_value = self.hand_value(self.dealer_hand)
             results = []
             total_winnings = 0
 
             for i, hand in enumerate(self.player_hands):
-                player_value = hand_value(hand)
+                player_value = self.hand_value(hand)
                 hand_wager = self.wager_usd * (2 if len(hand) > 2 and player_value <= 21 else 1)  # Double down detection
 
                 if player_value > 21:
                     results.append(f"Hand {i+1}: **BUST** ({player_value}) - Lost ${hand_wager:.2f}")
                 elif dealer_value > 21:
-                    winnings = hand_wager + (hand_wager * 0.82)
+                    winnings = hand_wager * 2  # Return wager + 1x win (1:1 payout)
                     total_winnings += winnings
                     results.append(f"Hand {i+1}: **WON** ({player_value} vs {dealer_value}) - +${winnings:.2f}")
                 elif player_value > dealer_value:
-                    winnings = hand_wager + (hand_wager * 0.82)
+                    winnings = hand_wager * 2  # Return wager + 1x win (1:1 payout)
                     total_winnings += winnings
                     results.append(f"Hand {i+1}: **WON** ({player_value} vs {dealer_value}) - +${winnings:.2f}")
                 elif dealer_value > player_value:
                     results.append(f"Hand {i+1}: **LOST** ({player_value} vs {dealer_value}) - Lost ${hand_wager:.2f}")
                 else:
+                    # Push - return original wager
                     total_winnings += hand_wager
-                    results.append(f"Hand {i+1}: **PUSH** ({player_value}) - Returned ${hand_wager:.2f}")
+                    results.append(f"Hand {i+1}: **PUSH** ({player_value} vs {dealer_value}) - Returned ${hand_wager:.2f}")
 
             balances[self.user_id]["balance"] += total_winnings
             balances[self.user_id]["wagered"] += self.total_wager
@@ -1576,20 +1773,28 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             title_emoji = "🎉" if net_result > 0 else "😔" if net_result < 0 else "🤝"
             title = f"🃏 Blackjack - Game Complete! {title_emoji}"
 
-            # Create final game image showing both hands revealed
-            player_img, dealer_img = await self.create_game_image(show_dealer_cards=True)
+            # Create final comprehensive game image showing all hands revealed
+            final_img, _ = await self.create_game_image(show_dealer_cards=True)
 
             embed = discord.Embed(title=title, color=color)
 
             # Show final hands with values
-            current_hand = self.player_hands[0] if len(self.player_hands) == 1 else None
-            if current_hand:
-                player_value = hand_value(current_hand)
-                embed.add_field(name="🃏 Your Hand", value=f"{format_hand(current_hand)} = **{player_value}**", inline=True)
+            if len(self.player_hands) == 1:
+                current_hand = self.player_hands[0]
+                player_value = self.hand_value(current_hand)
+                embed.add_field(name="🃏 Your Hand", value=f"{self.format_hand(current_hand)} = **{player_value}**", inline=True)
             else:
-                embed.add_field(name="🃏 Your Hands", value=self.format_all_hands(), inline=False)
+                hands_summary = []
+                for i, hand in enumerate(self.player_hands):
+                    hand_val = self.hand_value(hand)
+                    hands_summary.append(f"Hand {i+1}: {self.format_hand(hand)} = **{hand_val}**")
+                embed.add_field(name="🃏 Your Hands", value="\n".join(hands_summary), inline=False)
 
-            embed.add_field(name="🤖 Dealer Hand", value=f"{format_hand(self.dealer_hand)} = **{dealer_value}**", inline=True)
+            embed.add_field(name="🤖 Dealer Hand", value=f"{self.format_hand(self.dealer_hand)} = **{dealer_value}**", inline=True)
+
+            # Show detailed results for each hand
+            if len(results) > 1:
+                embed.add_field(name="📊 Individual Results", value="\n".join(results), inline=False)
 
             # Add game result
             if net_result > 0:
@@ -1597,17 +1802,17 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
             elif net_result < 0:
                 result_text = f"😔 **YOU LOST** {net_result:.2f}"
             else:
-                result_text = f"🤝 **PUSH** - No money lost"
+                result_text = f"🤝 **PUSH** - No money lost or gained"
 
             embed.add_field(name="🎯 Final Result", value=result_text, inline=False)
             embed.add_field(name="💰 Total Wagered", value=f"${self.total_wager:.2f} USD", inline=True)
             embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
 
-            # Attach final game image
+            # Attach final comprehensive game image
             files = []
-            if player_img and os.path.exists(player_img):
-                files.append(discord.File(player_img, filename="final_game.png"))
-                embed.set_image(url="attachment://final_game.png")
+            if final_img and os.path.exists(final_img):
+                files.append(discord.File(final_img, filename="final_blackjack.png"))
+                embed.set_image(url="attachment://final_blackjack.png")
 
             self.game_over = True
             try:
@@ -1616,13 +1821,12 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
                 else:
                     await interaction.response.edit_message(embed=embed, view=self, attachments=files)
 
-                # Clean up image files
-                for img_file in [player_img, dealer_img]:
-                    if img_file and os.path.exists(img_file):
-                        try:
-                            os.remove(img_file)
-                        except:
-                            pass
+                # Clean up image file
+                if final_img and os.path.exists(final_img):
+                    try:
+                        os.remove(final_img)
+                    except:
+                        pass
 
             except discord.errors.NotFound:
                 try:
@@ -1630,16 +1834,14 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
                 except:
                     pass
 
-    # Create initial card images
+    # Create initial comprehensive game image
     temp_generator = CardImageGenerator()
-    player_img = f"initial_player_{user_id}.png"
-    dealer_img = f"initial_dealer_{user_id}.png"
+    initial_img = f"initial_blackjack_{user_id}.png"
 
     try:
-        temp_generator.save_hand_image(player_hand, player_img)
-        temp_generator.save_hand_image(dealer_hand, dealer_img, hide_first=True)
+        temp_generator.save_blackjack_game_image([player_hand], dealer_hand, initial_img, 0, hide_dealer_first=True)
     except Exception as e:
-        print(f"Error creating initial card images: {e}")
+        print(f"Error creating initial blackjack image: {e}")
 
     # Create initial embed
     embed = discord.Embed(title="🃏 Blackjack - Your Turn", color=0x0099ff)
@@ -1648,24 +1850,23 @@ async def blackjack(interaction: discord.Interaction, wager_usd: float):
     embed.add_field(name="💰 Wager", value=f"${wager_usd:.2f} USD", inline=True)
     embed.set_footer(text="Hit: take another card | Stand: keep hand | Double Down: double bet + 1 card")
 
-    # Add card image if available
+    # Add comprehensive game image
     files = []
-    if os.path.exists(player_img):
-        files.append(discord.File(player_img, filename="game_cards.png"))
-        embed.set_image(url="attachment://game_cards.png")
+    if os.path.exists(initial_img):
+        files.append(discord.File(initial_img, filename="blackjack_start.png"))
+        embed.set_image(url="attachment://blackjack_start.png")
 
     view = BlackjackView(player_hand, dealer_hand, deck, wager_usd, user_id)
 
     try:
         await interaction.response.send_message(embed=embed, view=view, files=files)
 
-        # Clean up image files
-        for img_file in [player_img, dealer_img]:
-            if os.path.exists(img_file):
-                try:
-                    os.remove(img_file)
-                except:
-                    pass
+        # Clean up image file
+        if os.path.exists(initial_img):
+            try:
+                os.remove(initial_img)
+            except:
+                pass
     except Exception as e:
         # Fallback without images
         await interaction.response.send_message(embed=embed, view=view)
@@ -1686,8 +1887,8 @@ async def mines(interaction: discord.Interaction, wager_usd: float, mine_count: 
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if mine_count < 1 or mine_count > 24:
@@ -1790,7 +1991,7 @@ async def mines(interaction: discord.Interaction, wager_usd: float, mine_count: 
                         embed.add_field(name="💸 Result", value=f"You hit a mine! Lost ${self.wager_usd:.2f} USD", inline=True)
                         embed.add_field(name="💳 New Balance", value=f"${new_balance_usd:.2f} USD", inline=True)
 
-                        await interaction.response.edit_message(embed=embed)
+                        await interaction.response.edit_message(embed=embed, view=self)
                         return
                     else:
                         # Found a diamond
@@ -1837,7 +2038,7 @@ async def mines(interaction: discord.Interaction, wager_usd: float, mine_count: 
             embed.add_field(name="⬜ Tiles Left", value=str(25 - len(self.revealed_tiles)), inline=True)
             embed.set_footer(text="Click tiles to find diamonds! Click any revealed diamond to cash out.")
 
-            await interaction.response.edit_message(embed=embed)
+            await interaction.response.edit_message(embed=embed, view=self)
 
         async def cashout_callback(self, interaction: discord.Interaction):
             if interaction.user.id != int(self.user_id) or self.game_over:
@@ -1898,8 +2099,8 @@ async def towers(interaction: discord.Interaction, wager_usd: float, difficulty:
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if difficulty < 2 or difficulty > 4:
@@ -1966,7 +2167,7 @@ async def towers(interaction: discord.Interaction, wager_usd: float, difficulty:
                     row=1
                 )
                 cashout_button.callback = self.cashout_callback
-                self.add_item(button)
+                self.add_item(cashout_button)
 
         async def path_callback(self, interaction: discord.Interaction):
             if interaction.user.id != int(self.user_id) or self.game_over:
@@ -2160,6 +2361,21 @@ def load_withdrawal_queue():
 def save_withdrawal_queue(queue):
     with open("withdrawal_queue.json", "w") as f:
         json.dump(queue, f, indent=2)
+
+# LOAD MESSAGE TRACKING
+def load_message_tracking():
+    if not os.path.exists("message_tracking.json"):
+        return {}
+    with open("message_tracking.json", "r") as f:
+        return json.load(f)
+
+# SAVE MESSAGE TRACKING
+def save_message_tracking(data):
+    with open("message_tracking.json", "w") as f:
+        json.dump(data, f, indent=2)
+
+# Initialize message tracking after function definition
+message_tracking = load_message_tracking()
 
 # WITHDRAW (Modified to use queue system)
 @bot.tree.command(name="withdraw", description="Request a withdrawal to your Litecoin address (goes to admin queue)")
@@ -2381,6 +2597,9 @@ async def confirmdeposit(interaction: discord.Interaction, member: discord.Membe
 
     await interaction.response.send_message(embed=embed)
 
+    # Log the admin deposit action
+    await log_admin_deposit(interaction.user, member, amount_usd)
+
     # Notify the user
     try:
         user_embed = discord.Embed(
@@ -2451,9 +2670,13 @@ async def queue(interaction: discord.Interaction):
         queue_text = queue_text[:1000] + "..."
 
     embed.add_field(name="📋 Queue", value=queue_text if queue_text else "No pending requests", inline=False)
+    
+    # Calculate total withdrawal value
+    total_value = sum(data['amount_usd'] for data in withdrawal_queue.values())
+    embed.add_field(name="💰 Total Queue Value", value=f"${total_value:.2f} USD", inline=False)
 
     if len(sorted_withdrawals) > 10:
-        embed.set_footer(text="Showing 10 of {len(sorted_withdrawals)} requests. Use /confirmwithdraw to process them.")
+        embed.set_footer(text=f"Showing 10 of {len(sorted_withdrawals)} requests. Use /confirmwithdraw to process them.")
     else:
         embed.set_footer(text="Use /confirmwithdraw [withdrawal_id] to process requests")
 
@@ -2506,6 +2729,14 @@ async def confirmwithdraw(interaction: discord.Interaction, withdrawal_id: str):
 
     await interaction.response.send_message(embed=embed)
 
+    # Log the admin withdrawal action
+    try:
+        target_user = bot.get_user(int(user_id))
+        if target_user:
+            await log_admin_withdraw(interaction.user, target_user, amount_usd, ltc_address, withdrawal_id)
+    except Exception as e:
+        print(f"Error logging admin withdraw action: {e}")
+
     # Notify the user
     try:
         user = bot.get_user(int(user_id))
@@ -2530,6 +2761,71 @@ async def confirmwithdraw(interaction: discord.Interaction, withdrawal_id: str):
         print(f"Could not send withdrawal confirmation to user {user_id} - DMs disabled")
     except Exception as e:
         print(f"Error sending withdrawal confirmation: {e}")
+
+# CANCEL WITHDRAW COMMAND
+@bot.tree.command(name="cancelwithdraw", description="Admin command to cancel a withdrawal request and return funds to user")
+async def cancelwithdraw(interaction: discord.Interaction, withdrawal_id: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    # Check cooldown
+    can_proceed, remaining_time = check_cooldown(str(interaction.user.id))
+    if not can_proceed:
+        await interaction.response.send_message(f"⏱️ Please wait {remaining_time:.1f} seconds before using another command.", ephemeral=True)
+        return
+
+    withdrawal_queue = load_withdrawal_queue()
+
+    if withdrawal_id not in withdrawal_queue:
+        await interaction.response.send_message("❌ Withdrawal request not found! Use `/queue` to see pending requests.", ephemeral=True)
+        return
+
+    withdrawal_data = withdrawal_queue[withdrawal_id]
+    user_id = withdrawal_data['user_id']
+    amount_usd = withdrawal_data['amount_usd']
+    username = withdrawal_data['username']
+
+    # Remove from queue
+    del withdrawal_queue[withdrawal_id]
+    save_withdrawal_queue(withdrawal_queue)
+
+    # Return balance to user
+    init_user(user_id)
+    balances[user_id]["balance"] += amount_usd
+    save_balances(balances)
+
+    embed = discord.Embed(
+        title="❌ Withdrawal Cancelled & Refunded",
+        color=0xff6600
+    )
+    embed.add_field(name="👤 User", value=username, inline=True)
+    embed.add_field(name="💵 Amount Refunded", value=f"${amount_usd:.2f} USD", inline=True)
+    embed.add_field(name="🆔 Request ID", value=f"`{withdrawal_id}`", inline=True)
+    embed.add_field(name="💳 User's New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+    embed.set_footer(text="Withdrawal cancelled and funds returned by administrator")
+
+    await interaction.response.send_message(embed=embed)
+
+    # Notify the user
+    try:
+        user = bot.get_user(int(user_id))
+        if user:
+            user_embed = discord.Embed(
+                title="❌ Withdrawal Cancelled",
+                description="Your withdrawal request has been cancelled by an administrator",
+                color=0xff6600
+            )
+            user_embed.add_field(name="💵 Amount Refunded", value=f"${amount_usd:.2f} USD", inline=True)
+            user_embed.add_field(name="💳 New Balance", value=f"${balances[user_id]['balance']:.2f} USD", inline=True)
+            user_embed.add_field(name="🆔 Request ID", value=f"`{withdrawal_id}`", inline=True)
+            user_embed.set_footer(text="Your funds have been returned to your account")
+
+            await user.send(embed=user_embed)
+    except discord.Forbidden:
+        print(f"Could not send cancellation notification to user {user_id} - DMs disabled")
+    except Exception as e:
+        print(f"Error sending cancellation notification: {e}")
 
 # REMOVE BALANCE COMMAND
 @bot.tree.command(name="removebalance", description="Admin command to remove balance from a user")
@@ -2572,6 +2868,9 @@ async def removebalance(interaction: discord.Interaction, member: discord.Member
     embed.set_footer(text="Balance manually removed by administrator")
 
     await interaction.response.send_message(embed=embed)
+
+    # Log the admin balance removal
+    await log_admin_balance_change(interaction.user, member, amount_usd, "Removal")
 
     # Notify the user
     try:
@@ -2760,6 +3059,9 @@ async def affiliate(interaction: discord.Interaction, member: discord.Member):
 
     await interaction.response.send_message(embed=embed)
 
+    # Log the affiliation change
+    await log_affiliation_change(interaction.user, member, previous_affiliate)
+
     # Notify the affiliate
     try:
         affiliate_embed = discord.Embed(
@@ -2792,8 +3094,8 @@ async def limbo(interaction: discord.Interaction, wager_usd: float, target_multi
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if target_multiplier < 1.01 or target_multiplier > 1000:
@@ -2878,8 +3180,8 @@ async def plinko(interaction: discord.Interaction, wager_usd: float, rows: int =
         await interaction.response.send_message("❌ Wager amount must be positive!", ephemeral=True)
         return
 
-    if wager_usd < 0.01:
-        await interaction.response.send_message("❌ Minimum wager is $0.01 USD!", ephemeral=True)
+    if wager_usd < 0.10:
+        await interaction.response.send_message("❌ Minimum wager is $0.10 USD!", ephemeral=True)
         return
 
     if rows < 8 or rows > 16:
@@ -3076,8 +3378,9 @@ async def help_command(interaction: discord.Interaction):
 💳 `/addbalance [user] [amount]` - Add balance to user account
 💸 `/removebalance [user] [amount]` - Remove balance from user account
 🔄 `/resetstats [user]` - Reset user's complete account
-📋 `/queue` - View pending withdrawal requests
+📋 `/queue` - View pending withdrawal requests (shows total value)
 ✅ `/confirmwithdraw [withdrawal_id]` - Process withdrawal from queue
+❌ `/cancelwithdraw [withdrawal_id]` - Cancel withdrawal and refund user
 ✅ `/confirmdeposit [user] [amount]` - Credit a user's balance manually
 🏦 `/housebalance` - Check house wallet balance
 📤 `/housewithdraw [amount] [address]` - Withdraw from house wallet
@@ -3087,7 +3390,7 @@ async def help_command(interaction: discord.Interaction):
         embed.add_field(name="👑 Admin Commands", value=admin_text, inline=False)
 
     # Additional Info
-    embed.add_field(name="💡 Important Info", value="• All amounts are in USD\n• Minimum wager: $0.01\n• Rakeback rate: 0.5%\n• Commands have 1 second cooldown", inline=False)
+    embed.add_field(name="💡 Important Info", value="• All amounts are in USD\n• Minimum wager: $0.10\n• Rakeback rate: 0.5%\n• Commands have 1 second cooldown\n• Chat rewards: $0.10 per 100 messages", inline=False)
 
     embed.set_footer(text="🎲 Good luck and gamble responsibly!")
 
