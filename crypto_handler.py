@@ -1,3 +1,4 @@
+
 import aiohttp
 import asyncio
 import json
@@ -13,12 +14,47 @@ class LitecoinHandler:
         self.api_key = api_key
         self.webhook_secret = webhook_secret
         self.base_url = "https://api.blockcypher.com/v1/ltc/main"
+        self.apirone_url = "https://apirone.com/api/v2/ltc"
         self.bot = bot_instance
         self.monitoring_addresses = set()
         self.pending_transactions = {}
         self.house_wallet_address = None
         self.house_wallet_private_key = None
         self.scan_running = False
+
+    async def check_apirone_balance(self, address: str) -> Dict[str, Any]:
+        """Check balance using Apirone API for more accurate results"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.apirone_url}/addresses/{address}"
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'balance': data.get('balance', 0) / 100000000,
+                            'confirmed': data.get('confirmed', 0) / 100000000,
+                            'unconfirmed': data.get('unconfirmed', 0) / 100000000
+                        }
+                    else:
+                        return {'balance': 0, 'confirmed': 0, 'unconfirmed': 0}
+        except Exception as e:
+            print(f"Error checking Apirone balance: {e}")
+            return {'balance': 0, 'confirmed': 0, 'unconfirmed': 0}
+
+    async def get_apirone_transactions(self, address: str) -> List[Dict]:
+        """Get transaction history using Apirone API"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.apirone_url}/addresses/{address}/transactions"
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get('transactions', [])
+                    else:
+                        return []
+        except Exception as e:
+            print(f"Error getting Apirone transactions: {e}")
+            return []
 
     async def generate_deposit_address(self, user_id: str) -> Optional[str]:
         """Generate a new deposit address for a user"""
@@ -79,53 +115,6 @@ class LitecoinHandler:
         with open("crypto_addresses.json", "w") as f:
             json.dump(mappings, f, indent=2)
 
-    async def setup_webhook(self, address: str):
-        """Set up webhooks to monitor both unconfirmed and confirmed transactions"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                params = {"token": self.api_key}
-
-                # Webhook for unconfirmed transactions
-                unconfirmed_webhook = {
-                    "event": "unconfirmed-tx",
-                    "address": address,
-                    "url": "https://vaultbot-gambling.replit.app/webhook/litecoin"
-                }
-
-                # Webhook for confirmed transactions
-                confirmed_webhook = {
-                    "event": "confirmed-tx",
-                    "address": address,
-                    "url": "https://vaultbot-gambling.replit.app/webhook/litecoin"
-                }
-
-                # Set up both webhooks
-                for webhook_data in [unconfirmed_webhook, confirmed_webhook]:
-                    url = f"{self.base_url}/hooks"
-                    async with session.post(url, json=webhook_data, params=params) as response:
-                        if response.status == 201:
-                            webhook_response = await response.json()
-                            print(f"✅ Webhook set up for address {address} - event: {webhook_data['event']}")
-                            print(f"   Webhook ID: {webhook_response.get('id', 'Unknown')}")
-                        else:
-                            error_text = await response.text()
-                            print(f"❌ Failed to set up webhook for {webhook_data['event']}: HTTP {response.status}")
-                            print(f"   Error: {error_text}")
-
-                            # Try to parse error response
-                            try:
-                                error_data = json.loads(error_text)
-                                if 'error' in error_data:
-                                    print(f"   API Error: {error_data['error']}")
-                            except:
-                                pass
-
-                # Add to monitoring set
-                self.monitoring_addresses.add(address)
-
-        except Exception as e:
-            print(f"Error setting up webhook: {e}")
-
     async def initialize_house_wallet(self):
         """Initialize or load the house wallet"""
         try:
@@ -181,19 +170,9 @@ class LitecoinHandler:
             return 100.0
 
     async def get_address_balance(self, address: str) -> float:
-        """Get the balance of a specific address in LTC"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.base_url}/addrs/{address}/balance"
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data["balance"] / 100000000
-                    else:
-                        return 0.0
-        except Exception as e:
-            print(f"Error getting balance: {e}")
-            return 0.0
+        """Get the balance of a specific address in LTC using Apirone"""
+        apirone_data = await self.check_apirone_balance(address)
+        return apirone_data.get('confirmed', 0)
 
     async def get_house_balance(self) -> float:
         """Get the current house wallet balance in LTC"""
@@ -202,40 +181,28 @@ class LitecoinHandler:
         return await self.get_address_balance(self.house_wallet_address)
 
     async def scan_address_for_deposits(self, address: str) -> List[Dict]:
-        """Scan a specific address for new deposits"""
+        """Scan a specific address for new deposits using Apirone"""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.base_url}/addrs/{address}/full"
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        transactions = data.get('txs', [])
+            transactions = await self.get_apirone_transactions(address)
+            new_deposits = []
 
-                        new_deposits = []
+            for tx in transactions:
+                if tx.get('confirmations', 0) >= 1:
+                    # Check if this is an incoming transaction
+                    for output in tx.get('outputs', []):
+                        if address in output.get('addresses', []):
+                            amount_satoshis = output.get('value', 0)
+                            amount_ltc = amount_satoshis / 100000000
 
-                        for tx in transactions:
-                            tx_hash = tx['hash']
-                            confirmations = tx.get('confirmations', 0)
+                            if amount_ltc > 0:
+                                new_deposits.append({
+                                    'tx_hash': tx.get('hash'),
+                                    'amount_ltc': amount_ltc,
+                                    'confirmations': tx.get('confirmations', 0),
+                                    'address': address
+                                })
 
-                            # Only process confirmed transactions (1+ confirmations)
-                            if confirmations >= 1:
-                                # Check if this is an incoming transaction
-                                for output in tx.get('outputs', []):
-                                    if address in output.get('addresses', []):
-                                        amount_satoshis = output.get('value', 0)
-                                        amount_ltc = amount_satoshis / 100000000
-
-                                        if amount_ltc > 0:
-                                            new_deposits.append({
-                                                'tx_hash': tx_hash,
-                                                'amount_ltc': amount_ltc,
-                                                'confirmations': confirmations,
-                                                'address': address
-                                            })
-
-                        return new_deposits
-                    else:
-                        return []
+            return new_deposits
         except Exception as e:
             print(f"Error scanning address {address}: {e}")
             return []
@@ -299,7 +266,7 @@ class LitecoinHandler:
                         await user.send(embed=embed)
 
                         # Log deposit
-                        from main import log_deposit
+                        from bot import log_deposit
                         await log_deposit(user, amount_usd)
 
                 except Exception as e:
@@ -332,7 +299,7 @@ class LitecoinHandler:
             private_key = mappings[from_address]["private_key"]
 
             # Calculate fee and amount to send
-            fee_satoshis = 2000  # ~0.00002 LTC
+            fee_satoshis = 2000
             total_satoshis = int(amount_ltc * 100000000)
             amount_to_send = total_satoshis - fee_satoshis
 
@@ -341,7 +308,6 @@ class LitecoinHandler:
                 return None
 
             async with aiohttp.ClientSession() as session:
-                # Create transaction
                 tx_data = {
                     "inputs": [{"addresses": [from_address]}],
                     "outputs": [{"addresses": [self.house_wallet_address], "value": amount_to_send}]
@@ -355,7 +321,6 @@ class LitecoinHandler:
                         tx_skeleton = await response.json()
                         tx_skeleton["privkeys"] = [private_key]
 
-                        # Send signed transaction
                         send_url = f"{self.base_url}/txs/send"
                         async with session.post(send_url, json=tx_skeleton, params=params) as send_response:
                             if send_response.status == 201:
@@ -377,13 +342,13 @@ class LitecoinHandler:
             return None
 
     async def start_blockchain_scanner(self):
-        """Start the automatic blockchain scanner"""
+        """Start the automatic blockchain scanner using Apirone"""
         if self.scan_running:
             print("⚠️ Blockchain scanner already running")
             return
 
         self.scan_running = True
-        print("🔍 Starting automatic blockchain scanner...")
+        print("🔍 Starting Apirone blockchain scanner...")
 
         # Load existing processed transactions
         try:
@@ -406,7 +371,7 @@ class LitecoinHandler:
                 for address, addr_data in address_mappings.items():
                     user_id = addr_data['user_id']
 
-                    # Scan for deposits
+                    # Scan for deposits using Apirone
                     deposits = await self.scan_address_for_deposits(address)
 
                     for deposit in deposits:
@@ -435,11 +400,11 @@ class LitecoinHandler:
                     print(f"🔍 Processed {deposits_processed} new deposits")
 
                 # Wait before next scan
-                await asyncio.sleep(30)  # Scan every 30 seconds
+                await asyncio.sleep(30)
 
             except Exception as e:
                 print(f"❌ Error in blockchain scanner: {e}")
-                await asyncio.sleep(60)  # Wait longer on error
+                await asyncio.sleep(60)
 
     async def stop_blockchain_scanner(self):
         """Stop the blockchain scanner"""
