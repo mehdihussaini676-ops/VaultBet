@@ -10,3 +10,8 @@ aiohttp
 discord.py
 pillow
 python-dotenv
+aiohttp
+discord.py
+flask
+python-dotenv
+requests
