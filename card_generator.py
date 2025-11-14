@@ -45,88 +45,81 @@ class CardImageGenerator:
         return " ".join(f"{card[0]}{card[1]}" for card in hand)
 
     def create_card_image(self, rank, suit):
-        """Create a modern, clean BetRush-style playing card image"""
-        # Create card with crisp white background
+        """Create a premium playing card with enhanced styling"""
+        # Create card with white background and subtle shadow effect
         img = Image.new('RGB', (self.card_width, self.card_height), (255, 255, 255))
         draw = ImageDraw.Draw(img)
 
-        # Draw modern card border with subtle shadow effect
+        # Draw rounded border effect
+        border_color = (30, 30, 30)
         draw.rectangle([0, 0, self.card_width-1, self.card_height-1], 
-                      outline=(180, 180, 180), width=2)
-        draw.rectangle([2, 2, self.card_width-3, self.card_height-3], 
-                      outline=(245, 245, 245), width=1)
+                      outline=border_color, width=3)
+        
+        # Inner border for depth
+        draw.rectangle([3, 3, self.card_width-4, self.card_height-4], 
+                      outline=(200, 200, 200), width=1)
 
         # Get colors
         color = self.get_card_color(suit)
 
         try:
-            # Try to load fonts with better sizing for BetRush style
-            font_large = ImageFont.truetype("arial.ttf", 22)
-            font_medium = ImageFont.truetype("arial.ttf", 18)
-            font_small = ImageFont.truetype("arial.ttf", 14)
-            font_suit = ImageFont.truetype("arial.ttf", 28)
-            font_pip = ImageFont.truetype("arial.ttf", 20)
+            # Try to load fonts with better sizing
+            font_rank = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+            font_suit_corner = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+            font_suit_center = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 70)
         except:
             try:
-                font_large = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 22)
-                font_medium = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 18)
-                font_small = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 14)
-                font_suit = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 28)
-                font_pip = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 20)
+                font_rank = ImageFont.truetype("arial.ttf", 36)
+                font_suit_corner = ImageFont.truetype("arial.ttf", 32)
+                font_suit_center = ImageFont.truetype("arial.ttf", 70)
             except:
-                font_large = ImageFont.load_default()
-                font_medium = ImageFont.load_default()
-                font_small = ImageFont.load_default()
-                font_suit = ImageFont.load_default()
-                font_pip = ImageFont.load_default()
+                font_rank = ImageFont.load_default()
+                font_suit_corner = ImageFont.load_default()
+                font_suit_center = ImageFont.load_default()
 
         # Clean suit symbol
         suit_symbol = suit.replace('️', '').strip()
 
-        # Top-left corner with better positioning
-        draw.text((10, 8), rank, fill=color, font=font_large)
-        draw.text((10, 32), suit_symbol, fill=color, font=font_medium)
+        # Top-left corner with shadow effect
+        shadow_offset = 2
+        draw.text((10 + shadow_offset, 8 + shadow_offset), rank, fill=(220, 220, 220), font=font_rank)
+        draw.text((10, 8), rank, fill=color, font=font_rank)
+        
+        bbox = draw.textbbox((0, 0), suit_symbol, font=font_suit_corner)
+        text_width = bbox[2] - bbox[0]
+        suit_x = 10 + (36 - text_width) // 2
+        draw.text((suit_x + shadow_offset, 48 + shadow_offset), suit_symbol, fill=(220, 220, 220), font=font_suit_corner)
+        draw.text((suit_x, 48), suit_symbol, fill=color, font=font_suit_corner)
 
-        # Bottom-right corner (upside down) with better positioning
-        temp_img = Image.new('RGBA', (45, 65), (255, 255, 255, 0))
+        # Bottom-right corner (upside down) with shadow
+        temp_img = Image.new('RGBA', (60, 90), (255, 255, 255, 0))
         temp_draw = ImageDraw.Draw(temp_img)
-        temp_draw.text((8, 8), rank, fill=color, font=font_large)
-        temp_draw.text((8, 32), suit_symbol, fill=color, font=font_medium)
+        temp_draw.text((10 + shadow_offset, 8 + shadow_offset), rank, fill=(220, 220, 220, 255), font=font_rank)
+        temp_draw.text((10, 8), rank, fill=color + (255,), font=font_rank)
+        
+        bbox_temp = temp_draw.textbbox((0, 0), suit_symbol, font=font_suit_corner)
+        text_width_temp = bbox_temp[2] - bbox_temp[0]
+        temp_suit_x = 10 + (36 - text_width_temp) // 2
+        temp_draw.text((temp_suit_x + shadow_offset, 48 + shadow_offset), suit_symbol, fill=(220, 220, 220, 255), font=font_suit_corner)
+        temp_draw.text((temp_suit_x, 48), suit_symbol, fill=color + (255,), font=font_suit_corner)
         
         rotated = temp_img.rotate(180)
-        img.paste(rotated, (self.card_width-40, self.card_height-50), rotated)
+        img.paste(rotated, (self.card_width-55, self.card_height-85), rotated)
 
-        # Center design based on card type
+        # Center design - large suit symbol with subtle shadow
         center_x = self.card_width // 2
         center_y = self.card_height // 2
 
-        if rank in ['J', 'Q', 'K']:
-            # Face cards - cleaner design like BetRush
-            # Large suit symbol in center
-            bbox = draw.textbbox((0, 0), suit_symbol, font=font_suit)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            
-            draw.text((center_x - text_width//2, center_y - text_height//2 - 12), 
-                     suit_symbol, fill=color, font=font_suit)
-            
-            # Rank letter below with better spacing
-            bbox = draw.textbbox((0, 0), rank, font=font_large)
-            text_width = bbox[2] - bbox[0]
-            draw.text((center_x - text_width//2, center_y + 8), 
-                     rank, fill=color, font=font_large)
+        bbox = draw.textbbox((0, 0), suit_symbol, font=font_suit_center)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
         
-        elif rank == 'A':
-            # Ace - large centered suit like BetRush
-            bbox = draw.textbbox((0, 0), suit_symbol, font=font_suit)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            draw.text((center_x - text_width//2, center_y - text_height//2), 
-                     suit_symbol, fill=color, font=font_suit)
-        
-        else:
-            # Number cards - cleaner pip arrangement
-            self.draw_pips_betrush_style(draw, rank, suit_symbol, color, font_pip)
+        # Shadow
+        draw.text((center_x - text_width//2 + shadow_offset, center_y - text_height//2 + shadow_offset), 
+                 suit_symbol, fill=(220, 220, 220), font=font_suit_center)
+        # Main symbol
+        draw.text((center_x - text_width//2, center_y - text_height//2), 
+                 suit_symbol, fill=color, font=font_suit_center)
 
         return img
 
