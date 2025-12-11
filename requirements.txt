@@ -7,3 +7,12 @@ pillow>=10.0.0
 psycopg2-binary>=2.9.0
 bitcoinlib
 ecdsa
+aiohttp
+bitcoinlib
+discord.py
+ecdsa
+flask
+pillow
+psycopg2-binary
+python-dotenv
+requests
